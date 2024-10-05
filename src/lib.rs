@@ -1,10 +1,8 @@
-use std::{borrow::Borrow, collections::VecDeque, hash::Hash, ops::Deref, sync::Arc};
-
-use index_list::IndexList;
-use slotmap::DefaultKey;
+use std::{borrow::Borrow, hash::Hash, ops::Deref};
 
 pub mod map;
 pub mod sharded;
+pub mod evict;
 // pub mod sync;
 
 pub trait Cache {
@@ -158,109 +156,73 @@ pub trait Value {
     fn key(&self) -> &Self::Key;
 }
 
-pub trait Eviction<T: Clone> {
-    type Value;
-    type Shard;
+// #[derive(Debug)]
+// pub struct NoEviction;
 
-    fn new_shard(&mut self, capacity: usize) -> Self::Shard;
+// pub struct LruEviction;
 
-    fn new_value(&self, shard: &mut Self::Shard, construct: impl FnOnce(Self::Value) -> T) -> (T, Option<T>);
-    fn touch_value(&self, shard: &mut Self::Shard, value: &Self::Value);
-    fn remove_value(&self, shard: &mut Self::Shard, value: &Self::Value);
-}
+// impl<T: Clone> Eviction<T> for LruEviction {
+//     type Value = (usize, u32);
+//     type Shard = LruEvictionShard<T>;
 
-pub trait EvictionStrategy<R: Clone> {
-    type ValueState;
-    type ShardState;
+//     fn new_shard(&mut self, capacity: usize) -> Self::Shard {
+//         LruEvictionShard { 
+//             order: Vec::with_capacity(capacity),
+//             head: 0,
+//             tail: 0,
+//         }
+//     }
 
-    fn new_shard(&mut self, capacity: usize) -> Self::ShardState;
-    fn new_value(&self, shard: &mut Self::ShardState, value_ref: R) -> (Self::ValueState, Option<R>);
-    fn touch_value(&self, shard: &mut Self::ShardState, value: &Self::ValueState) -> bool;
-    fn remove_value(&self, shard: &mut Self::ShardState, value: &Self::ValueState);
-}
-
-#[derive(Debug)]
-pub struct NoEviction;
-
-impl<R: Clone> EvictionStrategy<R> for NoEviction {
-    type ValueState = ();
-    type ShardState = ();
-
-    fn new_shard(&mut self, capacity: usize) -> Self::ShardState {
-        ()
-    }
-
-    fn new_value(&self, _shard: &mut Self::ShardState, _index: R) -> (Self::ValueState, Option<R>) {
-        ((), None)
-    }
-
-    fn touch_value(&self, _shard: &mut Self::ShardState, _value: &Self::ValueState) -> bool {
-        true
-    }
-
-    fn remove_value(&self, _shard: &mut Self::ShardState, _value: &Self::ValueState) {}
-}
-
-pub struct LruEviction;
-
-impl<T: Clone> Eviction<T> for LruEviction {
-    type Value = (usize, u32);
-    type Shard = LruEvictionShard<T>;
-
-    fn new_shard(&mut self, capacity: usize) -> Self::Shard {
-        LruEvictionShard { 
-            order: Vec::with_capacity(capacity),
-            head: 0,
-            tail: 0,
-        }
-    }
-
-    fn new_value(&self, shard: &mut Self::Shard, construct: impl FnOnce(Self::Value) -> T) -> (T, Option<T>) {
-        // let removed = if shard.order.len() == shard.order.capacity() {
-        //     // shard.order.remove_first().map(|k| shard.slots.remove(k).unwrap())
-        //     None
-        // } else {
-        //     None
-        // };
+//     fn insert(&self, shard: &mut Self::Shard, construct: impl FnOnce(Self::Value) -> T) -> (T, Option<T>) {
+//         // let removed = if shard.order.len() == shard.order.capacity() {
+//         //     // shard.order.remove_first().map(|k| shard.slots.remove(k).unwrap())
+//         //     None
+//         // } else {
+//         //     None
+//         // };
         
-        // if net new
-        let index = shard.order.len();
-        let value = construct((index, 0));
-        shard.order.push(Node {
-            generation: 0,
-            value: Some(value.clone()),
-            next: 0,
-            prev: 0,
-        });
+//         // if net new
+//         let index = shard.order.len();
+//         let value = construct((index, 0));
+//         shard.order.push(Node {
+//             generation: 0,
+//             value: Some(value.clone()),
+//             next: 0,
+//             prev: 0,
+//         });
         
-        (value, None)
-    }
+//         (value, None)
+//     }
 
-    fn touch_value(&self, shard: &mut Self::Shard, value: &Self::Value) {
-        let (index, generation) = *value;
-        debug_assert_eq!(shard.order[index].generation, generation);
-    }
+//     fn touch(&self, shard: &mut Self::Shard, value: &Self::Value) {
+//         let (index, generation) = *value;
+//         debug_assert_eq!(shard.order[index].generation, generation);
+//     }
 
-    fn remove_value(&self, shard: &mut Self::Shard, value: &Self::Value) {
-        let (index, generation) = *value;
-        debug_assert_eq!(shard.order[index].generation, generation);
-        shard.order[index].value = None;
-        shard.order[index].generation += 1;
+//     fn remove(&self, shard: &mut Self::Shard, value: &Self::Value) {
+//         let (index, generation) = *value;
+//         debug_assert_eq!(shard.order[index].generation, generation);
+//         shard.order[index].value = None;
+//         shard.order[index].generation += 1;
 
-        todo!()
-    }
+//         todo!()
+//     }
+
+//     fn replace(&self, shard: &mut Self::Shard, remove: &Self::Value, construct: impl FnOnce(Self::Value) -> T) -> T {
+        
+//     }
     
-}
+// }
 
-struct LruEvictionShard<T> {
-    order: Vec<Node<T>>,
-    head: usize,
-    tail: usize,
-}
+// struct LruEvictionShard<T> {
+//     order: Vec<Node<T>>,
+//     head: usize,
+//     tail: usize,
+// }
 
-struct Node<T> {
-    generation: u32,
-    value: Option<T>,
-    next: usize,
-    prev: usize,
-}
+// struct Node<T> {
+//     generation: u32,
+//     value: Option<T>,
+//     next: usize,
+//     prev: usize,
+// }
