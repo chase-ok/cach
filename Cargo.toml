@@ -7,9 +7,3 @@ edition = "2021"
 crossbeam-utils = "0.8.20"
 hashbrown = { version = "0.14.5", features = ["raw"] }
 parking_lot = "0.12.3"
-
-[target.'cfg(loom)'.dependencies]
-loom = "0.7"
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

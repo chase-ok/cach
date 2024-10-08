@@ -1,13 +1,15 @@
-use std::ops::{Deref, DerefMut};
+use std::{
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+};
 
-use parking_lot::{RwLockReadGuard, RwLockUpgradableReadGuard};
-
+use parking_lot::{RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
 
 mod index;
 pub mod lru;
 
-pub trait Eviction<T: Clone> {
-    type Value;
+pub trait Eviction<P: Deref + Clone> {
+    type State;
     type Shard;
 
     fn new_shard(&mut self, capacity: usize) -> Self::Shard;
@@ -15,45 +17,150 @@ pub trait Eviction<T: Clone> {
     fn insert(
         &self,
         shard: &mut Self::Shard,
-        construct: impl FnOnce(Self::Value) -> T,
-    ) -> (T, Option<T>);
+        construct: impl FnOnce(Self::State) -> P,
+    ) -> (P, Option<P>);
 
-    fn touch(&self, shard: &Self::Shard, value: &Self::Value);
-    // fn touch(&self, shard: impl UpgradeLock<Target = Self::Shard>, value: &Self::Value);
+    fn touch(
+        &self,
+        shard: impl UpgradeReadGuard<Target = Self::Shard>,
+        state: &Self::State,
+        pointer: &P,
+    );
 
-    fn remove(&self, shard: &mut Self::Shard, value: &Self::Value);
+    fn remove(&self, shard: &mut Self::Shard, state: &Self::State);
 
     fn replace(
         &self,
         shard: &mut Self::Shard,
-        remove: &Self::Value,
-        construct: impl FnOnce(Self::Value) -> T,
-    ) -> T;
+        state: &Self::State,
+        construct: impl FnOnce(Self::State) -> P,
+    ) -> P;
 }
 
-pub trait UpgradeLock: Deref {
+pub trait BuildEviction {
+    fn build<P: Deref + Clone>(self) -> impl Eviction<P>;
+}
+
+pub trait UpgradeReadGuard: Deref {
     fn upgrade(self) -> impl Deref<Target = Self::Target> + DerefMut;
-}
 
-impl<T> UpgradeLock for RwLockUpgradableReadGuard<'_, T> {
-    fn upgrade(self) -> impl Deref<Target = Self::Target> + DerefMut {
-        RwLockUpgradableReadGuard::upgrade(self)
+    fn try_upgrade(self) -> Option<impl Deref<Target = Self::Target> + DerefMut>
+    where
+        Self: Sized,
+    {
+        Some(self.upgrade())
     }
 }
 
-impl<T> UpgradeLock for RwLockReadGuard<'_, T> {
+impl<T> UpgradeReadGuard for RwLockUpgradableReadGuard<'_, T> {
+    fn upgrade(self) -> impl Deref<Target = Self::Target> + DerefMut {
+        RwLockUpgradableReadGuard::upgrade(self)
+    }
+
+    fn try_upgrade(self) -> Option<impl Deref<Target = Self::Target> + DerefMut> {
+        RwLockUpgradableReadGuard::try_upgrade(self).ok()
+    }
+}
+
+impl<T> UpgradeReadGuard for RwLockReadGuard<'_, T> {
     fn upgrade(self) -> impl Deref<Target = Self::Target> + DerefMut {
         let lock = RwLockReadGuard::rwlock(&self);
         drop(self);
         lock.write()
     }
+
+    fn try_upgrade(self) -> Option<impl Deref<Target = Self::Target> + DerefMut> {
+        let lock = RwLockReadGuard::rwlock(&self);
+        drop(self);
+        lock.try_write()
+    }
 }
 
-#[derive(Debug)]
+impl<T> UpgradeReadGuard for RwLockWriteGuard<'_, T> {
+    fn upgrade(self) -> impl Deref<Target = Self::Target> + DerefMut {
+        self
+    }
+}
+
+pub struct MapUpgradeReadGuard<G, T, D, DM> {
+    guard: G,
+    _target: PhantomData<T>,
+    deref: D,
+    deref_mut: DM,
+}
+
+impl<G, T, D, DM> MapUpgradeReadGuard<G, T, D, DM>
+where
+    G: Deref,
+    D: Fn(&G::Target) -> &T,
+    DM: Fn(&mut G::Target) -> &mut T,
+{
+    pub fn new(guard: G, deref: D, deref_mut: DM) -> Self {
+        Self {
+            guard,
+            _target: PhantomData,
+            deref,
+            deref_mut,
+        }
+    }
+
+    pub fn guard(this: &Self) -> &G {
+        &this.guard
+    }
+
+    pub fn guard_mut(this: &mut Self) -> &mut G {
+        &mut this.guard
+    }
+
+    pub fn into_guard(this: Self) -> G {
+        this.guard
+    }
+}
+
+impl<G, T, D, DM> Deref for MapUpgradeReadGuard<G, T, D, DM>
+where
+    G: Deref,
+    D: Fn(&G::Target) -> &T,
+{
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        (self.deref)(&self.guard)
+    }
+}
+
+impl<G, T, D, DM> DerefMut for MapUpgradeReadGuard<G, T, D, DM>
+where
+    G: DerefMut,
+    D: Fn(&G::Target) -> &T,
+    DM: Fn(&mut G::Target) -> &mut T,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        (self.deref_mut)(&mut self.guard)
+    }
+}
+
+impl<G, T, D, DM> UpgradeReadGuard for MapUpgradeReadGuard<G, T, D, DM>
+where
+    G: UpgradeReadGuard,
+    D: Fn(&G::Target) -> &T,
+    DM: Fn(&mut G::Target) -> &mut T,
+{
+    fn upgrade(self) -> impl Deref<Target = Self::Target> + DerefMut {
+        MapUpgradeReadGuard {
+            guard: self.guard.upgrade(),
+            _target: PhantomData,
+            deref: self.deref,
+            deref_mut: self.deref_mut,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct NoEviction;
 
-impl<T: Clone> Eviction<T> for NoEviction {
-    type Value = ();
+impl<E: Deref + Clone> Eviction<E> for NoEviction {
+    type State = ();
     type Shard = ();
 
     fn new_shard(&mut self, _capacity: usize) -> Self::Shard {
@@ -63,21 +170,32 @@ impl<T: Clone> Eviction<T> for NoEviction {
     fn insert(
         &self,
         _shard: &mut Self::Shard,
-        construct: impl FnOnce(Self::Value) -> T,
-    ) -> (T, Option<T>) {
+        construct: impl FnOnce(Self::State) -> E,
+    ) -> (E, Option<E>) {
         (construct(()), None)
     }
 
-    fn touch(&self, _shard: &Self::Shard, _value: &Self::Value) {}
+    fn touch(
+        &self,
+        _shard: impl UpgradeReadGuard<Target = Self::Shard>,
+        _state: &Self::State,
+        _entry: &E,
+    ) { }
 
-    fn remove(&self, _shard: &mut Self::Shard, _value: &Self::Value) {}
+    fn remove(&self, _shard: &mut Self::Shard, _state: &Self::State) { }
 
     fn replace(
         &self,
         _shard: &mut Self::Shard,
-        _remove: &Self::Value,
-        construct: impl FnOnce(Self::Value) -> T,
-    ) -> T {
+        _state: &Self::State,
+        construct: impl FnOnce(Self::State) -> E,
+    ) -> E {
         construct(())
+    }
+}
+
+impl BuildEviction for NoEviction {
+    fn build<P: Deref + Clone>(self) -> impl Eviction<P> {
+        self
     }
 }
