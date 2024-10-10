@@ -33,24 +33,24 @@ impl<K: Eq + Hash, V> crate::Value for MapEntry<K, V> {
 #[derive(Debug, Clone)]
 pub struct MapPointer<P>(P);
 
-impl<K, V, P: Deref<Target = MapEntry<K, V>>> Deref for MapPointer<P> {
-    type Target = V;
+// impl<K, V, P: Deref<Target = MapEntry<K, V>>> Deref for MapPointer<P> {
+//     type Target = V;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0.1
-    }
-}
+//     fn deref(&self) -> &Self::Target {
+//         &self.0.1
+//     }
+// }
 
-impl<K: Eq + Hash, V, C: Cache<MapEntry<K, V>>> MapCache<K, V, C> {
-    // XX good to override if can avoid write lock
-    fn get<Q: ?Sized>(&self, key: &Q) -> Option<MapPointer<C::Pointer>>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        self.cache.get(key).map(MapPointer)
-    }
-}
+// impl<K: Eq + Hash, V, C: Cache<MapEntry<K, V>>> MapCache<K, V, C> {
+//     // XX good to override if can avoid write lock
+//     fn get<Q: ?Sized>(&self, key: &Q) -> Option<MapPointer<C::Pointer>>
+//     where
+//         K: Borrow<Q>,
+//         Q: Hash + Eq,
+//     {
+//         self.cache.get(key).map(MapPointer)
+//     }
+// }
 
 
 

@@ -14,8 +14,8 @@ use hashbrown::{
 use parking_lot::{RwLock, RwLockWriteGuard};
 
 use crate::{
-    evict::{BuildEviction, Eviction, MapUpgradeReadGuard, NoEviction},
-    BuildCache, Cache,
+    evict::{Eviction, MapUpgradeReadGuard, NoEviction},
+    Cache,
 };
 
 pub const MAX_SHARDS: usize = 2048;
@@ -82,19 +82,13 @@ impl<E, S> ShardedCacheBuilder<E, S> {
     pub fn capacity(self, capacity: usize) -> Self {
         Self { capacity: Some(capacity), ..self }
     }
-}
 
-fn target_shards_to_exact(target: usize) -> usize {
-    target
-        .checked_next_power_of_two()
-        .unwrap_or(usize::MAX)
-        .min(MAX_SHARDS)
-}
-
-impl<T: crate::Value, E: BuildEviction, S: BuildHasher> BuildCache<T> for ShardedCacheBuilder<E, S> {
-    fn build(self) -> impl Cache<T> {
-        let mut eviction = self.eviction.build();
-
+    pub fn build<T, Ev>(mut self) -> impl Cache<T> 
+    where 
+        T: crate::Value + 'static,
+        E: Eviction<Pointer<T, Ev>, Value = Ev>,
+        S: BuildHasher,
+    {
         let capacity = self
             .capacity
             .unwrap_or_else(|| self.shards.saturating_mul(16));
@@ -103,7 +97,7 @@ impl<T: crate::Value, E: BuildEviction, S: BuildHasher> BuildCache<T> for Sharde
         let shards = std::iter::repeat_with(|| {
             CachePadded::new(RwLock::new(Shard {
                 values: RawTable::with_capacity(capacity_per_shard),
-                eviction: eviction.new_shard(capacity_per_shard),
+                eviction: self.eviction.new_shard(capacity_per_shard),
             }))
         })
         .take(self.shards)
@@ -113,37 +107,44 @@ impl<T: crate::Value, E: BuildEviction, S: BuildHasher> BuildCache<T> for Sharde
             shards,
             hash_builder: self.hash_builder,
             mask: self.shards - 1,
-            eviction,
+            eviction: self.eviction,
         }
     }
 }
 
-struct ShardedCache<T, E: Eviction<Pointer<T, E>> = NoEviction, S = DefaultHashBuilder> {
-    shards: Vec<CachePadded<RwLock<Shard<T, E>>>>,
+fn target_shards_to_exact(target: usize) -> usize {
+    target
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+        .min(MAX_SHARDS)
+}
+
+struct ShardedCache<T, E, Ev, Es, S> {
+    shards: Vec<CachePadded<RwLock<Shard<T, Ev, Es>>>>,
     hash_builder: S,
     mask: usize,
     eviction: E,
 }
 
-struct Shard<T, E: Eviction<Pointer<T, E>>> {
-    values: RawTable<Pointer<T, E>>,
-    eviction: E::Shard,
+struct Shard<T, Ev, Es> {
+    values: RawTable<Pointer<T, Ev>>,
+    eviction: Es,
 }
 
-struct Value<T, E: Eviction<Pointer<T, E>>> {
+struct Value<T, E> {
     value: T,
-    eviction: E::State,
+    eviction: E,
 }
 
-pub struct Pointer<T, E: Eviction<Pointer<T, E>>>(Arc<Value<T, E>>);
+pub struct Pointer<T, E>(Arc<Value<T, E>>);
 
-impl<T, E: Eviction<Pointer<T, E>>> Clone for Pointer<T, E> {
+impl<T, E> Clone for Pointer<T, E> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl<T, E: Eviction<Pointer<T, E>>> Deref for Pointer<T, E> {
+impl<T, E> Deref for Pointer<T, E> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -151,12 +152,15 @@ impl<T, E: Eviction<Pointer<T, E>>> Deref for Pointer<T, E> {
     }
 }
 
-impl<T: crate::Value + 'static, E: Eviction<Pointer<T, E>>, S: BuildHasher> Cache<T>
-    for ShardedCache<T, E, S>
+// impl<T: crate::Value + 'static, E: Eviction<Pointer<T, E>>, S: BuildHasher> Cache<T>
+impl<T, E, Ev, Es, S> Cache<T> for ShardedCache<T, E, Ev, Es, S>
 where
+    T: crate::Value + 'static,
     T::Key: Hash + Eq,
+    E: Eviction<Pointer<T, Ev>, Value = Ev, Shard = Es>,
+    S: BuildHasher,
 {
-    type Pointer = Pointer<T, E>;
+    type Pointer = Pointer<T, Ev>;
 
     fn len(&self) -> usize {
         self.shards
@@ -219,7 +223,7 @@ where
     }
 }
 
-impl<T, E: Eviction<Pointer<T, E>>, S: BuildHasher> ShardedCache<T, E, S> {
+impl<T, E, Ev, Es, S: BuildHasher> ShardedCache<T, E, Ev, Es, S> {
     fn hash_and_shard(&self, key: &(impl Hash + ?Sized)) -> (u64, usize) {
         let hash = self.hash_builder.hash_one(key);
         // XX is the double hash actually helping?
@@ -228,17 +232,25 @@ impl<T, E: Eviction<Pointer<T, E>>, S: BuildHasher> ShardedCache<T, E, S> {
     }
 }
 
-struct OccupiedEntry<'a, T: crate::Value, E: Eviction<Pointer<T, E>>, S>(
-    Option<OccupiedEntryInner<'a, T, E, S>>,
-);
+struct OccupiedEntry<'a, T: crate::Value, E, Ev, Es, S>(
+    Option<OccupiedEntryInner<'a, T, E, Ev, Es, S>>,
+)
+where
+    T: crate::Value + 'static,
+    E: Eviction<Pointer<T, Ev>, Value = Ev, Shard = Es>,
+;
 
-struct OccupiedEntryInner<'a, T: crate::Value, E: Eviction<Pointer<T, E>>, S> {
-    cache: &'a ShardedCache<T, E, S>,
-    shard: RwLockWriteGuard<'a, Shard<T, E>>,
-    bucket: Bucket<Pointer<T, E>>,
+struct OccupiedEntryInner<'a, T: crate::Value, E, Ev, Es, S> {
+    cache: &'a ShardedCache<T, E, Ev, Es, S>,
+    shard: RwLockWriteGuard<'a, Shard<T, Ev, Es>>,
+    bucket: Bucket<Pointer<T, Ev>>,
 }
 
-impl<T: crate::Value, E: Eviction<Pointer<T, E>>, S> Drop for OccupiedEntry<'_, T, E, S> {
+impl<T, E, Ev, Es, S> Drop for OccupiedEntry<'_, T, E, Ev, Es, S> 
+where 
+    T: crate::Value + 'static,
+    E: Eviction<Pointer<T, Ev>, Value = Ev, Shard = Es>,
+{
     fn drop(&mut self) {
         if let Some(inner) = self.0.take() {
             // XX Safety
@@ -253,26 +265,21 @@ impl<T: crate::Value, E: Eviction<Pointer<T, E>>, S> Drop for OccupiedEntry<'_, 
     }
 }
 
-impl<T: crate::Value, E: Eviction<Pointer<T, E>>, S> OccupiedEntryInner<'_, T, E, S> {
-    fn pointer(&self) -> &Pointer<T, E> {
+impl<T: crate::Value, E, Ev, Es, S> OccupiedEntryInner<'_, T, E, Ev, Es, S> {
+    fn pointer(&self) -> &Pointer<T, Ev> {
         // XX Safety
         unsafe { self.bucket.as_ref() }
     }
 }
 
-struct VacantEntry<'a, T: crate::Value, E: Eviction<Pointer<T, E>>, S> {
-    cache: &'a ShardedCache<T, E, S>,
-    shard: RwLockWriteGuard<'a, Shard<T, E>>,
-    slot: InsertSlot,
-    hash: u64,
-}
-
-impl<T: crate::Value + 'static, E: Eviction<Pointer<T, E>>, S: BuildHasher> crate::OccupiedEntry
-    for OccupiedEntry<'_, T, E, S>
+impl<T, E, Ev, Es, S> crate::OccupiedEntry for OccupiedEntry<'_, T, E, Ev, Es, S> 
+where 
+    T: crate::Value + 'static,
+    E: Eviction<Pointer<T, Ev>, Value = Ev, Shard = Es>,
 {
-    type Pointer = Pointer<T, E>;
+    type Pointer = Pointer<T, Ev>;
 
-    fn pointer(&self) -> Pointer<T, E> {
+    fn pointer(&self) -> Pointer<T, Ev> {
         self.0.as_ref().unwrap().pointer().clone()
     }
 
@@ -280,7 +287,7 @@ impl<T: crate::Value + 'static, E: Eviction<Pointer<T, E>>, S: BuildHasher> crat
         &self.0.as_ref().unwrap().pointer()
     }
 
-    fn replace(mut self, value: T) -> Pointer<T, E> {
+    fn replace(mut self, value: T) -> Pointer<T, Ev> {
         let mut inner = self.0.take().unwrap();
 
         // XX Safety
@@ -298,7 +305,7 @@ impl<T: crate::Value + 'static, E: Eviction<Pointer<T, E>>, S: BuildHasher> crat
         replace
     }
 
-    fn remove(mut self) -> Pointer<T, E> {
+    fn remove(mut self) -> Pointer<T, Ev> {
         let mut inner = self.0.take().unwrap();
 
         // XX Safety
@@ -311,12 +318,22 @@ impl<T: crate::Value + 'static, E: Eviction<Pointer<T, E>>, S: BuildHasher> crat
     }
 }
 
-impl<T: crate::Value + 'static, E: Eviction<Pointer<T, E>>, S: BuildHasher> crate::VacantEntry
-    for VacantEntry<'_, T, E, S>
-{
-    type Pointer = Pointer<T, E>;
+struct VacantEntry<'a, T, E, Ev, Es, S> {
+    cache: &'a ShardedCache<T, E, Ev, Es, S>,
+    shard: RwLockWriteGuard<'a, Shard<T, Ev, Es>>,
+    slot: InsertSlot,
+    hash: u64,
+}
 
-    fn insert(mut self, value: T) -> Pointer<T, E> {
+impl<T, E, Ev, Es, S> crate::VacantEntry for VacantEntry<'_, T, E, Ev, Es, S> 
+where 
+    T: crate::Value + 'static,
+    E: Eviction<Pointer<T, Ev>, Value = Ev, Shard = Es>,
+    S: BuildHasher,
+{
+    type Pointer = Pointer<T, Ev>;
+
+    fn insert(mut self, value: T) -> Pointer<T, Ev> {
         debug_assert_eq!(self.hash, self.cache.hash_builder.hash_one(value.key()));
 
         let (insert, evict) = self

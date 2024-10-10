@@ -10,8 +10,8 @@ use super::{Eviction, UpgradeReadGuard};
 #[derive(Debug)]
 pub struct LruEviction;
 
-impl<E: Deref + Clone> Eviction<E> for LruEviction {
-    type State = Key;
+impl<E: Clone> Eviction<E> for LruEviction {
+    type Value = Key;
     type Shard = IndexList<E>;
 
     fn new_shard(&mut self, capacity: usize) -> Self::Shard {
@@ -21,7 +21,7 @@ impl<E: Deref + Clone> Eviction<E> for LruEviction {
     fn insert(
         &self,
         shard: &mut Self::Shard,
-        construct: impl FnOnce(Self::State) -> E,
+        construct: impl FnOnce(Self::Value) -> E,
     ) -> (E, Option<E>) {
         let removed = if shard.len() == shard.capacity() {
             shard.head_key().and_then(|k| shard.remove(k))
@@ -33,19 +33,19 @@ impl<E: Deref + Clone> Eviction<E> for LruEviction {
         (value.clone(), removed)
     }
 
-    fn touch(&self, shard: impl UpgradeReadGuard<Target = Self::Shard>, state: &Self::State, _entry: &E) {
+    fn touch(&self, shard: impl UpgradeReadGuard<Target = Self::Shard>, state: &Self::Value, _entry: &E) {
         UpgradeReadGuard::upgrade(shard).move_to_tail(*state);
     }
 
-    fn remove(&self, shard: &mut Self::Shard, state: &Self::State) {
+    fn remove(&self, shard: &mut Self::Shard, state: &Self::Value) {
         shard.remove(*state).unwrap();
     }
 
     fn replace(
         &self,
         shard: &mut Self::Shard,
-        remove: &Self::State,
-        construct: impl FnOnce(Self::State) -> E,
+        remove: &Self::Value,
+        construct: impl FnOnce(Self::Value) -> E,
     ) -> E {
         shard.remove(*remove).unwrap();
         let (_key, value) = shard.insert_tail_with_key(construct);
@@ -80,8 +80,8 @@ impl<C> ApproximateLruEviction<C> {
     }
 }
 
-impl<C: Clock, E: Deref + Clone> Eviction<E> for ApproximateLruEviction<C> {
-    type State = (AtomicInstant, <LruEviction as Eviction<E>>::State);
+impl<C: Clock, E: Clone> Eviction<E> for ApproximateLruEviction<C> {
+    type Value = (AtomicInstant, <LruEviction as Eviction<E>>::Value);
     type Shard = <LruEviction as Eviction<E>>::Shard;
 
     fn new_shard(&mut self, capacity: usize) -> Self::Shard {
@@ -91,12 +91,12 @@ impl<C: Clock, E: Deref + Clone> Eviction<E> for ApproximateLruEviction<C> {
     fn insert(
         &self,
         shard: &mut Self::Shard,
-        construct: impl FnOnce(Self::State) -> E,
+        construct: impl FnOnce(Self::Value) -> E,
     ) -> (E, Option<E>) {
         LruEviction.insert(shard, |key| construct((self.clock.now().into(), key)))
     }
 
-    fn touch(&self, shard: impl UpgradeReadGuard<Target = Self::Shard>, state: &Self::State, entry: &E) {
+    fn touch(&self, shard: impl UpgradeReadGuard<Target = Self::Shard>, state: &Self::Value, entry: &E) {
         let now = self.clock.now();
         let since_touched = now
             .checked_duration_since(state.0.load(Ordering::Relaxed))
@@ -112,15 +112,15 @@ impl<C: Clock, E: Deref + Clone> Eviction<E> for ApproximateLruEviction<C> {
         }
     }
 
-    fn remove(&self, shard: &mut Self::Shard, value: &Self::State) {
+    fn remove(&self, shard: &mut Self::Shard, value: &Self::Value) {
         LruEviction.remove(shard, &value.1);
     }
 
     fn replace(
         &self,
         shard: &mut Self::Shard,
-        remove: &Self::State,
-        construct: impl FnOnce(Self::State) -> E,
+        remove: &Self::Value,
+        construct: impl FnOnce(Self::Value) -> E,
     ) -> E {
         LruEviction.replace(shard, &remove.1, |key| {
             construct((self.clock.now().into(), key))
@@ -161,7 +161,7 @@ where
     E: Deref + Clone,
     E::Target: TouchedTime
 {
-    type State = <LruEviction as Eviction<E>>::State;
+    type Value = <LruEviction as Eviction<E>>::Value;
     type Shard = <LruEviction as Eviction<E>>::Shard;
 
     fn new_shard(&mut self, capacity: usize) -> Self::Shard {
@@ -171,12 +171,12 @@ where
     fn insert(
         &self,
         shard: &mut Self::Shard,
-        construct: impl FnOnce(Self::State) -> E,
+        construct: impl FnOnce(Self::Value) -> E,
     ) -> (E, Option<E>) {
         LruEviction.insert(shard, construct)
     }
 
-    fn touch(&self, shard: impl UpgradeReadGuard<Target = Self::Shard>, state: &Self::State, entry: &E) {
+    fn touch(&self, shard: impl UpgradeReadGuard<Target = Self::Shard>, state: &Self::Value, entry: &E) {
         let now = self.clock.now();
         let since_touched = now.checked_duration_since(entry.last_touched()).unwrap_or_default();
 
@@ -191,15 +191,15 @@ where
         }
     }
 
-    fn remove(&self, shard: &mut Self::Shard, value: &Self::State) {
+    fn remove(&self, shard: &mut Self::Shard, value: &Self::Value) {
         LruEviction.remove(shard, value);
     }
 
     fn replace(
         &self,
         shard: &mut Self::Shard,
-        remove: &Self::State,
-        construct: impl FnOnce(Self::State) -> E,
+        remove: &Self::Value,
+        construct: impl FnOnce(Self::Value) -> E,
     ) -> E {
         LruEviction.replace(shard, remove, construct)
     }

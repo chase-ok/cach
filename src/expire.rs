@@ -1,33 +1,16 @@
 use std::{borrow::Borrow, hash::Hash, ops::Deref};
 
-use crate::{time::ExpiryTime, BuildCache, Cache, CachePointerFn, Clock, DefaultClock, OccupiedEntry, Value};
+use crate::{
+    time::ExpiryTime, Cache, wrap::CacheWrapper, Clock, DefaultClock, OccupiedEntry, Value,
+};
 
 pub trait Expire {
     fn is_expired(&self) -> bool;
 }
 
-pub(crate) struct IntrusiveExpireCacheBuilder<B>(B);
+pub(crate) struct ExpireCache<C>(pub C);
 
-impl<B> IntrusiveExpireCacheBuilder<B> {
-    pub fn new(builder: B) -> Self {
-        Self(builder)
-    }
-}
-
-impl<T, B> BuildCache<T> for IntrusiveExpireCacheBuilder<B>
-where
-    T: Value + Expire,
-    B: BuildCache<T>,
-{
-    fn build(self) -> impl Cache<T> {
-        IntrusiveExpireCache(self.0)
-    }
-}
-
-
-struct IntrusiveExpireCache<C>(C);
-
-impl<T, C> Cache<T> for IntrusiveExpireCache<C>
+impl<T, C> Cache<T> for ExpireCache<C>
 where
     T: Value + Expire,
     C: Cache<T>,
@@ -51,8 +34,7 @@ where
     {
         match self.0.entry(key) {
             crate::Entry::Occupied(occupied) => {
-                if occupied.value().is_expired()
-                {
+                if occupied.value().is_expired() {
                     crate::Entry::Occupied(occupied)
                 } else {
                     crate::Entry::Vacant(Vacant(Some(VacantInner::Expired(occupied))))
@@ -102,57 +84,93 @@ impl<O: crate::OccupiedEntry, V> Drop for Vacant<O, V> {
     }
 }
 
-pub(crate) struct IntrusiveExpiryTimeCacheBuilder<B, C = DefaultClock> {
-    builder: B,
+// #[derive(Debug, Default)]
+// pub struct ExpireAtIntrusive<C>(C);
+
+// impl<T, C> Layer<ExpiryTimeValue<T, C>> for ExpireAtIntrusive<C> 
+// where 
+//     T: Value + ExpiryTime,
+//     C: Clock + Clone,
+// {
+//     type Value = T;
+
+//     fn layer(self, inner: impl Cache<ExpiryTimeValue<T, C>>) -> impl Cache<T> {
+//         CacheWrapper::new(ExpireIntrusiveCache(inner), move |value| {
+//             ExpiryTimeValue {
+//                 value,
+//                 clock: self.0.clone(),
+//             }
+//         })
+//     }
+// }
+
+// impl<C: BuildCache<ExpiryTimeValue<T, Clk>>, T: Value + ExpiryTime, Clk> CacheLayer<C, T> for ExpireAtIntrusive<Clk> 
+// where 
+//     C: BuildCache<ExpiryTimeValue<T, Clk>>, 
+//     T: Value + ExpiryTime, 
+//     Clk: Clock + Clone,
+// {
+//     fn layer(self, inner: C) -> impl BuildCache<T> {
+//         struct Build<C, Clk>(C, Clk);
+
+//         impl<C: BuildCache<ExpiryTimeValue<T, Clk>>, T: Value + ExpiryTime, Clk> BuildCache<T> for Build<C, Clk> 
+//         where
+//             C: BuildCache<ExpiryTimeValue<T, Clk>>, 
+//             T: Value + ExpiryTime, 
+//             Clk: Clock + Clone,
+//         {
+//             fn build(self) -> impl Cache<T> {
+//                 CacheWrapper::new(ExpireIntrusiveCache(self.0.build()), move |value| {
+//                     ExpiryTimeValue {
+//                         value,
+//                         clock: self.1.clone(),
+//                     }
+//                 })
+//             }
+//         }
+
+//         Build(inner, self.0)
+//     }
+// }
+
+// pub(crate) fn expire_at_intrusive<T, C>(cache: impl Cache<ExpiryTimeValue<T, C>>, clock: C) -> impl Cache<T> 
+// where 
+//     T: Value + ExpiryTime,
+//     C: Clock + Clone
+// {
+//     CacheWrapper::new(ExpireIntrusiveCache(cache), move |value| {
+//         ExpiryTimeValue {
+//             value,
+//             clock: clock.clone(),
+//         }
+//     })
+// }
+
+pub struct ExpiryTimeValue<T, C> {
+    value: T,
     clock: C,
 }
 
-impl<B, C> IntrusiveExpiryTimeCacheBuilder<B, C> {
-    pub fn new(builder: B, clock: C) -> Self {
-        Self { builder, clock }
+impl<T: Value, C> Value for ExpiryTimeValue<T, C> {
+    type Key = T::Key;
+
+    fn key(&self) -> &Self::Key {
+        self.value.key()
     }
 }
 
-impl<T, B, C> BuildCache<T> for IntrusiveExpiryTimeCacheBuilder<B, C>
-where 
-    T: Value + ExpiryTime,
-    B: BuildCache<ExpiryTimeValue<T>>,
-    C: Clock + Clone,
-{
-    fn build(self) -> impl Cache<T> {
-        CachePointerFn::new(self.builder.intrusive_expiry(), move |pointer| ExpiryTimePointer(pointer))
+impl<T: ExpiryTime, C: Clock> Expire for ExpiryTimeValue<T, C> {
+    fn is_expired(&self) -> bool {
+        self.value
+            .expiry_time()
+            .is_some_and(|t| t <= self.clock.now())
     }
 }
 
-pub struct ExpiryTimeValue<T>(T);
-pub struct ExpiryTimePointer<P>(P);
+impl<T, C> Deref for ExpiryTimeValue<T, C> {
+    type Target = T;
 
-struct IntrusiveExpiryTimeCache<C, Clk> {
-    cache: IntrusiveExpireCache<C>,
-    clock: Clk,
-}
-
-impl<T, C, Clk> Cache<T> for IntrusiveExpiryTimeCache<C, Clk> 
-where
-    T: Value + ExpiryTime,
-    C: Cache<ExpiryTimeValue<T>>,
-    C: Clock + Default,
-{
-    type Pointer = ExpiryTimePointer<C::Pointer>;
-
-    fn len(&self) -> usize {
-        self.cache.len()
-    }
-
-    fn entry<'c, 'k, K>(
-        &'c self,
-        key: &'k K,
-    ) -> crate::Entry<impl OccupiedEntry<Pointer = Self::Pointer> + 'c, impl crate::VacantEntry<Pointer = Self::Pointer> + 'c>
-    where
-        <T as Value>::Key: Borrow<K>,
-        K: ?Sized + Hash + Eq 
-    {
-        
+    fn deref(&self) -> &Self::Target {
+        &self.value
     }
 }
-

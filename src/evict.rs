@@ -8,8 +8,8 @@ use parking_lot::{RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
 mod index;
 pub mod lru;
 
-pub trait Eviction<P: Deref + Clone> {
-    type State;
+pub trait Eviction<P> {
+    type Value;
     type Shard;
 
     fn new_shard(&mut self, capacity: usize) -> Self::Shard;
@@ -17,28 +17,24 @@ pub trait Eviction<P: Deref + Clone> {
     fn insert(
         &self,
         shard: &mut Self::Shard,
-        construct: impl FnOnce(Self::State) -> P,
+        construct: impl FnOnce(Self::Value) -> P,
     ) -> (P, Option<P>);
 
     fn touch(
         &self,
         shard: impl UpgradeReadGuard<Target = Self::Shard>,
-        state: &Self::State,
+        value: &Self::Value,
         pointer: &P,
     );
 
-    fn remove(&self, shard: &mut Self::Shard, state: &Self::State);
+    fn remove(&self, shard: &mut Self::Shard, value: &Self::Value);
 
     fn replace(
         &self,
         shard: &mut Self::Shard,
-        state: &Self::State,
-        construct: impl FnOnce(Self::State) -> P,
+        state: &Self::Value,
+        construct: impl FnOnce(Self::Value) -> P,
     ) -> P;
-}
-
-pub trait BuildEviction {
-    fn build<P: Deref + Clone>(self) -> impl Eviction<P>;
 }
 
 pub trait UpgradeReadGuard: Deref {
@@ -159,8 +155,8 @@ where
 #[derive(Debug, Default)]
 pub struct NoEviction;
 
-impl<E: Deref + Clone> Eviction<E> for NoEviction {
-    type State = ();
+impl<E> Eviction<E> for NoEviction {
+    type Value = ();
     type Shard = ();
 
     fn new_shard(&mut self, _capacity: usize) -> Self::Shard {
@@ -170,7 +166,7 @@ impl<E: Deref + Clone> Eviction<E> for NoEviction {
     fn insert(
         &self,
         _shard: &mut Self::Shard,
-        construct: impl FnOnce(Self::State) -> E,
+        construct: impl FnOnce(Self::Value) -> E,
     ) -> (E, Option<E>) {
         (construct(()), None)
     }
@@ -178,24 +174,18 @@ impl<E: Deref + Clone> Eviction<E> for NoEviction {
     fn touch(
         &self,
         _shard: impl UpgradeReadGuard<Target = Self::Shard>,
-        _state: &Self::State,
+        _state: &Self::Value,
         _entry: &E,
     ) { }
 
-    fn remove(&self, _shard: &mut Self::Shard, _state: &Self::State) { }
+    fn remove(&self, _shard: &mut Self::Shard, _state: &Self::Value) { }
 
     fn replace(
         &self,
         _shard: &mut Self::Shard,
-        _state: &Self::State,
-        construct: impl FnOnce(Self::State) -> E,
+        _state: &Self::Value,
+        construct: impl FnOnce(Self::Value) -> E,
     ) -> E {
         construct(())
-    }
-}
-
-impl BuildEviction for NoEviction {
-    fn build<P: Deref + Clone>(self) -> impl Eviction<P> {
-        self
     }
 }

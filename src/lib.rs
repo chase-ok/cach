@@ -4,10 +4,9 @@ pub mod evict;
 pub mod map;
 pub mod sharded;
 mod time;
-use map::MapCache;
 pub use time::{Clock, DefaultClock};
 pub mod expire;
-// pub mod sync;
+mod wrap;
 
 pub trait Cache<T: Value> {
     type Pointer: Deref<Target = T> + Clone;
@@ -161,159 +160,64 @@ pub trait Value {
     fn key(&self) -> &Self::Key;
 }
 
-pub trait BuildCache<T: Value> {
-    fn build(self) -> impl Cache<T>;
-}
+// pub trait Layer<T: Value> {
+//     type Value: Value;
 
-pub trait BuildCacheExt<T: Value>: Sized + BuildCache<T> {
-    fn intrusive_expiring(self) -> impl BuildCache<T>
+//     fn layer(self, inner: impl Cache<T>) -> impl Cache<Self::Value>;
+// }
+
+pub trait CacheExt<T: Value>: Cache<T> {
+    // fn layer<L>(self, layer: L) -> impl Cache<L::Value>
+    // where 
+    //     Self: Sized,
+    //     L: Layer<T>,
+    // {
+    //     layer.layer(self)
+    // }
+
+    fn expire_intrusive(self) -> impl Cache<T>
     where
+        Self: Sized,
         T: expire::Expire,
     {
-        expire::IntrusiveExpireCacheBuilder::new(self)
+        expire::ExpireCache(self)
+        // self.layer(expire::ExpireIntrusive)
     }
 
-    fn expire_after_write_intrusive(self) -> impl BuildCache<T> {
-        self
-        // IntrusiveExpiryTimeCache {
-        //     inner: todo!(),
-        //     clock: todo!(),
-        // }
-    }
+    // fn expire_at_intrusive<S>(self) -> impl BuildCache<S>
+    // where
+    //     Self: Sized + BuildCache<expire::ExpiryTimeValue<S, DefaultClock>>,
+    //     S: Value + time::ExpiryTime,
+    // {
+    //     <Self as BuildCacheExt<expire::ExpiryTimeValue<S, DefaultClock>>>::layer(self, expire::ExpireAtIntrusive::<DefaultClock>::default())
+    // }
 }
 
-impl<T: Value, C: BuildCache<T> + Sized> BuildCacheExt<T> for C {}
+impl<T: Value, C: Cache<T>> CacheExt<T> for C {}
 
-pub trait BuildMapCacheExt<K: Eq + Hash, V>: Sized + BuildCache<map::MapEntry<K, V>> {
-    fn build_map_cache(self) -> MapCache<K, V, Self> {}
-}
-
-impl<K: Eq + Hash, V, C: BuildCache<map::MapEntry<K, V>> + Sized> BuildMapCacheExt<K, V> for C {}
-
-struct CachePointerFn<C, P, F> {
-    cache: C,
-    _pointer: PhantomData<P>,
-    pointer_fn: F,
-}
-
-impl<C, P, F> CachePointerFn<C, P, F> {
-    pub(crate) fn new(cache: C, pointer_fn: F) -> Self {
-        Self {
-            cache,
-            _pointer: PhantomData,
-            pointer_fn,
-        }
-    }
-}
-
-impl<T, C, P, F> Cache<T> for CachePointerFn<C, P, F>
-where
-    T: Value,
-    C: Cache<T>,
-    P: Deref<Target = T> + Clone,
-    F: Fn(C::Pointer) -> P,
-{
-    type Pointer = P;
-
-    fn len(&self) -> usize {
-        self.cache.len()
-    }
-
-    fn entry<'c, 'k, K>(
-        &'c self,
-        key: &'k K,
-    ) -> Entry<
-        impl OccupiedEntry<Pointer = Self::Pointer> + 'c,
-        impl VacantEntry<Pointer = Self::Pointer> + 'c,
-    >
-    where
-        <T as Value>::Key: Borrow<K>,
-        K: ?Sized + Hash + Eq,
-    {
-        match self.cache.entry(key) {
-            Entry::Occupied(occupied) => {
-                struct Occupied<'c, O, P, F> {
-                    occupied: O,
-                    _pointer: PhantomData<P>,
-                    pointer_fn: &'c F,
-                }
-
-                impl<O, P, F> OccupiedEntry for Occupied<'_, O, P, F>
-                where
-                    O: OccupiedEntry,
-                    P: Deref,
-                    F: Fn(O::Pointer) -> P,
-                {
-                    type Pointer = P;
-
-                    fn value(&self) -> &<Self::Pointer as Deref>::Target {
-                        self.occupied.value()
-                    }
-
-                    fn pointer(&self) -> Self::Pointer {
-                        (self.pointer_fn)(self.occupied.pointer())
-                    }
-
-                    fn into_pointer(self) -> Self::Pointer {
-                        (self.pointer_fn)(self.occupied.into_pointer())
-                    }
-
-                    fn replace(self, value: <Self::Pointer as Deref>::Target) -> Self::Pointer
-                    where
-                        <Self::Pointer as Deref>::Target: Sized,
-                    {
-                        (self.pointer_fn)(self.occupied.replace(value))
-                    }
-
-                    fn remove(self) -> Self::Pointer {
-                        (self.pointer_fn)(self.occupied.remove())
-                    }
-                }
-
-                Entry::Occupied(Occupied {
-                    occupied,
-                    _pointer: PhantomData,
-                    pointer_fn: &self.pointer_fn,
-                })
-            }
-            Entry::Vacant(vacant) => {
-                struct Vacant<'c, V, P, F> {
-                    vacant: V,
-                    _pointer: PhantomData<P>,
-                    pointer_fn: &'c F,
-                }
-
-                impl<O, P, F> VacantEntry for Vacant<'_, O, P, F>
-                where
-                    O: VacantEntry,
-                    P: Deref,
-                    F: Fn(O::Pointer) -> P,
-                {
-                    type Pointer = P;
-                    
-                    fn insert(self, value: <Self::Pointer as Deref>::Target) -> Self::Pointer
-                    where
-                        <Self::Pointer as Deref>::Target: Sized 
-                    {
-                        (self.pointer_fn)(self.vacant.insert(value))
-                    }
-
-                }
-
-                Entry::Vacant(Vacant {
-                    vacant,
-                    _pointer: PhantomData,
-                    pointer_fn: &self.pointer_fn,
-                })
-            }
+#[test]
+fn test() {
+    
+    struct Test(String);
+    impl Value for Test {
+        type Key = str;
+    
+        fn key(&self) -> &Self::Key {
+            &self.0
         }
     }
 
-    fn get<K: ?Sized>(&self, key: &K) -> Option<Self::Pointer>
-    where
-        <T as Value>::Key: Borrow<K>,
-        K: Hash + Eq,
-    {
-        self.cache.get(key).map(self.pointer_fn)
+    impl expire::Expire for Test {
+        fn is_expired(&self) -> bool {
+            false
+        }
     }
+
+    let cache = sharded::ShardedCacheBuilder::new()
+        .build()
+        .expire_intrusive();
+        // .layer(expire::ExpireIntrusive);
+        // .expire_intrusive();
+    cache.insert(Test("abc".into()));
+
 }
