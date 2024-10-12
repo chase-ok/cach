@@ -94,4 +94,10 @@ impl<T> IndexList<T> {
                 NodeState::Vacant { .. } => None,
             })
     }
+    
+    pub fn drain(&mut self) -> impl Iterator<Item = T> {
+
+        todo!();
+        std::iter::empty()
+    }
 }

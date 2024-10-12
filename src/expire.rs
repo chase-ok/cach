@@ -1,14 +1,24 @@
-use std::{borrow::Borrow, hash::Hash, ops::Deref};
+use std::{borrow::Borrow, hash::Hash, ops::Deref, time::Instant};
 
 use crate::{
-    time::ExpiryTime, Cache, wrap::CacheWrapper, Clock, DefaultClock, OccupiedEntry, Value,
+    build::Layer, time::ExpiryTime, Cache, Clock, DefaultClock, OccupiedEntry, Value
 };
 
 pub trait Expire {
     fn is_expired(&self) -> bool;
 }
 
-pub(crate) struct ExpireCache<C>(pub C);
+pub struct ExpireLayer;
+
+impl<C> Layer<C> for ExpireLayer {
+    type Cache = ExpireCache<C>;
+
+    fn layer(self, inner: C) -> Self::Cache {
+        ExpireCache(inner)
+    }
+}
+
+pub struct ExpireCache<C>(C);
 
 impl<T, C> Cache<T> for ExpireCache<C>
 where
@@ -79,6 +89,74 @@ impl<O: crate::OccupiedEntry, V> Drop for Vacant<O, V> {
                     o.remove();
                 }
                 _ => {}
+            }
+        }
+    }
+}
+
+pub trait ExpireAt {
+    fn expire_at(&self) -> Instant;
+}
+
+#[derive(Debug, Default)]
+pub struct ExpireAtLayer<C = DefaultClock>(C);
+
+impl<C> ExpireAtLayer<C> {
+    pub fn new(clock: C) -> Self {
+        Self(clock)
+    }
+}
+
+impl<C, Clk> Layer<C> for ExpireAtLayer<Clk> {
+    type Cache = ExpireAtCache<C, Clk>;
+
+    fn layer(self, inner: C) -> Self::Cache {
+        ExpireAtCache {
+            inner,
+            clock: self.0,
+        }
+    }
+}
+
+pub struct ExpireAtCache<C, Clk = DefaultClock> {
+    inner: C,
+    clock: Clk,
+}
+
+impl<T, C, Clk> Cache<T> for ExpireAtCache<C, Clk>
+where
+    T: Value + ExpireAt,
+    C: Cache<T>,
+    Clk: Clock,
+{
+    type Pointer = C::Pointer;
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn entry<'c, 'k, K>(
+        &'c self,
+        key: &'k K,
+    ) -> crate::Entry<
+        impl crate::OccupiedEntry<Pointer = Self::Pointer> + 'c,
+        impl crate::VacantEntry<Pointer = Self::Pointer> + 'c,
+    >
+    where
+        T::Key: Borrow<K>,
+        K: ?Sized + Hash + Eq,
+    {
+        match self.inner.entry(key) {
+            crate::Entry::Occupied(occupied) => {
+                if occupied.value().expire_at() >= self.clock.now() {
+                    crate::Entry::Occupied(occupied)
+                } else {
+                    crate::Entry::Vacant(Vacant(Some(VacantInner::Expired(occupied))))
+                }
+            }
+
+            crate::Entry::Vacant(vacant) => {
+                crate::Entry::Vacant(Vacant(Some(VacantInner::Vacant(vacant))))
             }
         }
     }

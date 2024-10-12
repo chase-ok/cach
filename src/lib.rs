@@ -1,12 +1,16 @@
-use std::{borrow::Borrow, hash::Hash, marker::PhantomData, ops::Deref};
+use std::{borrow::Borrow, hash::Hash, ops::Deref};
 
+pub mod build;
 pub mod evict;
-pub mod map;
-pub mod sharded;
-mod time;
-pub use time::{Clock, DefaultClock};
 pub mod expire;
+pub mod map;
+pub mod sync;
+pub mod time;
+pub mod lock;
+pub mod local;
 mod wrap;
+
+use time::{Clock, DefaultClock};
 
 pub trait Cache<T: Value> {
     type Pointer: Deref<Target = T> + Clone;
@@ -160,64 +164,39 @@ pub trait Value {
     fn key(&self) -> &Self::Key;
 }
 
-// pub trait Layer<T: Value> {
-//     type Value: Value;
 
-//     fn layer(self, inner: impl Cache<T>) -> impl Cache<Self::Value>;
-// }
-
-pub trait CacheExt<T: Value>: Cache<T> {
-    // fn layer<L>(self, layer: L) -> impl Cache<L::Value>
-    // where 
-    //     Self: Sized,
-    //     L: Layer<T>,
-    // {
-    //     layer.layer(self)
-    // }
-
-    fn expire_intrusive(self) -> impl Cache<T>
-    where
-        Self: Sized,
-        T: expire::Expire,
-    {
-        expire::ExpireCache(self)
-        // self.layer(expire::ExpireIntrusive)
-    }
-
-    // fn expire_at_intrusive<S>(self) -> impl BuildCache<S>
-    // where
-    //     Self: Sized + BuildCache<expire::ExpiryTimeValue<S, DefaultClock>>,
-    //     S: Value + time::ExpiryTime,
-    // {
-    //     <Self as BuildCacheExt<expire::ExpiryTimeValue<S, DefaultClock>>>::layer(self, expire::ExpireAtIntrusive::<DefaultClock>::default())
-    // }
-}
-
-impl<T: Value, C: Cache<T>> CacheExt<T> for C {}
 
 #[test]
 fn test() {
-    
-    struct Test(String);
+    use build::{BuildCacheExt as _, BuildCache as _};
+    use evict::lru::EvictLeastRecentlyUsed;
+    use std::time::Instant;
+
+    struct Test {
+        key: String,
+        expire: Instant,
+    }
+
     impl Value for Test {
         type Key = str;
-    
+
         fn key(&self) -> &Self::Key {
-            &self.0
+            &self.key
         }
     }
 
-    impl expire::Expire for Test {
-        fn is_expired(&self) -> bool {
-            false
+    impl expire::ExpireAt for Test {
+        fn expire_at(&self) -> Instant {
+            self.expire
         }
     }
 
-    let cache = sharded::ShardedCacheBuilder::new()
-        .build()
-        .expire_intrusive();
-        // .layer(expire::ExpireIntrusive);
-        // .expire_intrusive();
-    cache.insert(Test("abc".into()));
-
+    let cache = sync::SyncCacheBuilder::new()
+        .evict(evict::lri::EvictExpiredLeastRecentlyInserted::default())
+        .expire_at()
+        .build();
+    // .expire_intrusive();
+    // .layer(expire::ExpireIntrusive);
+    // .expire_intrusive();
+    cache.insert(Test { key: "abc".into(), expire: Instant::now() });
 }
