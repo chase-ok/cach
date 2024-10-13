@@ -1,7 +1,7 @@
 use std::{borrow::Borrow, hash::Hash, ops::Deref, time::Instant};
 
 use crate::{
-    build::Layer, time::ExpiryTime, Cache, Clock, DefaultClock, OccupiedEntry, Value
+    build::Layer, target, time::ExpiryTime, Cache, Clock, DefaultClock, LockedOccupiedEntry, Mutate, Mutated, Value
 };
 
 pub trait Expire {
@@ -27,46 +27,59 @@ where
 {
     type Pointer = C::Pointer;
 
+    const PREFER_LOCKED: bool = C::PREFER_LOCKED;
+
     fn len(&self) -> usize {
         self.0.len()
     }
 
-    fn entry<'c, 'k, K>(
+    fn locked_entry<'c, 'k, K>(
         &'c self,
         key: &'k K,
-    ) -> crate::Entry<
-        impl crate::OccupiedEntry<Pointer = Self::Pointer> + 'c,
-        impl crate::VacantEntry<Pointer = Self::Pointer> + 'c,
+    ) -> crate::LockedEntry<
+        impl crate::LockedOccupiedEntry<Pointer = Self::Pointer> + 'c,
+        impl crate::LockedVacantEntry<Pointer = Self::Pointer> + 'c,
     >
     where
         T::Key: Borrow<K>,
         K: ?Sized + Hash + Eq,
     {
-        match self.0.entry(key) {
-            crate::Entry::Occupied(occupied) => {
+        match self.0.locked_entry(key) {
+            crate::LockedEntry::Occupied(occupied) => {
                 if occupied.value().is_expired() {
-                    crate::Entry::Occupied(occupied)
+                    crate::LockedEntry::Occupied(occupied)
                 } else {
-                    crate::Entry::Vacant(Vacant(Some(VacantInner::Expired(occupied))))
+                    crate::LockedEntry::Vacant(Vacant(Some(VacantInner::Expired(occupied))))
                 }
             }
 
-            crate::Entry::Vacant(vacant) => {
-                crate::Entry::Vacant(Vacant(Some(VacantInner::Vacant(vacant))))
+            crate::LockedEntry::Vacant(vacant) => {
+                crate::LockedEntry::Vacant(Vacant(Some(VacantInner::Vacant(vacant))))
             }
+        }
+    }
+
+    fn entry<'c, 'k, K>(&'c self, key: &'k K) -> impl crate::Entry<Pointer = Self::Pointer> + 'c
+    where
+        <T as Value>::Key: Borrow<K>,
+        K: ?Sized + Hash + Eq,
+    {
+        ExpireEntry {
+            entry: self.0.entry(key), 
+            expired: |v| v.is_expired()
         }
     }
 }
 
-struct Vacant<O: crate::OccupiedEntry, V>(Option<VacantInner<O, V>>);
+struct Vacant<O: crate::LockedOccupiedEntry, V>(Option<VacantInner<O, V>>);
 
 enum VacantInner<O, V> {
     Expired(O),
     Vacant(V),
 }
 
-impl<O: crate::OccupiedEntry, V: crate::VacantEntry<Pointer = O::Pointer>> crate::VacantEntry
-    for Vacant<O, V>
+impl<O: crate::LockedOccupiedEntry, V: crate::LockedVacantEntry<Pointer = O::Pointer>>
+    crate::LockedVacantEntry for Vacant<O, V>
 {
     type Pointer = O::Pointer;
 
@@ -81,7 +94,7 @@ impl<O: crate::OccupiedEntry, V: crate::VacantEntry<Pointer = O::Pointer>> crate
     }
 }
 
-impl<O: crate::OccupiedEntry, V> Drop for Vacant<O, V> {
+impl<O: crate::LockedOccupiedEntry, V> Drop for Vacant<O, V> {
     fn drop(&mut self) {
         if let Some(inner) = self.0.take() {
             match inner {
@@ -91,6 +104,60 @@ impl<O: crate::OccupiedEntry, V> Drop for Vacant<O, V> {
                 _ => {}
             }
         }
+    }
+}
+
+struct ExpireEntry<E, F> {
+    entry: Option<E>,
+    expired: F,
+}
+
+impl<E, F> crate::Entry for ExpireEntry<E, F> 
+where 
+    E: crate::Entry, 
+    <E::Pointer as Deref>::Target: Value,
+    F: Fn(&target!(E)) -> bool,
+{
+    type Pointer = E::Pointer;
+
+    fn value(&self) -> Option<&target!(Self)> {
+        self.entry.as_ref().unwrap().value().filter(|v| (self.expired)(v))
+    }
+
+    fn pointer(&self) -> Option<Self::Pointer> {
+        self.entry.as_ref().unwrap().pointer().filter(|p| (self.expired)(p))
+    }
+
+    fn key(&self) -> &<target!(Self) as Value>::Key {
+        todo!()
+    }
+
+    fn try_mutate(
+        &mut self,
+        mutate: Mutate<target!(Self)>,
+    ) -> Result<Mutated<Self::Pointer>, Mutate<target!(Self)>>
+    where
+        target!(Self): Sized
+    {
+        let mut entry = self.entry.take().unwrap();
+        todo!()
+        // let mut f = Some(f);
+        // loop {
+        //     let result = entry.try_mutate(|current| {
+        //         match current {
+        //             Some(value) if (self.expired)(value) => Mutate::Remove(None),
+        //             current => (f.take().unwrap())(current),
+        //         }
+        //     });
+        //     match result {
+        //         Ok(mutated) if f.is_some() => return Ok(mutated),
+        //         Ok(Mutated::None { .. } | Mutated::Removed { .. }) => continue,
+        //         Ok(_) => unreachable!(),
+        //         Err((entry, state)) => {
+        //             return Err((ExpireEntry { entry: Some(entry), expired: self.expired }, state))
+        //         }
+        //     }
+        // }
     }
 }
 
@@ -131,33 +198,46 @@ where
 {
     type Pointer = C::Pointer;
 
+    const PREFER_LOCKED: bool = C::PREFER_LOCKED;
+
     fn len(&self) -> usize {
         self.inner.len()
     }
 
-    fn entry<'c, 'k, K>(
+    fn locked_entry<'c, 'k, K>(
         &'c self,
         key: &'k K,
-    ) -> crate::Entry<
-        impl crate::OccupiedEntry<Pointer = Self::Pointer> + 'c,
-        impl crate::VacantEntry<Pointer = Self::Pointer> + 'c,
+    ) -> crate::LockedEntry<
+        impl crate::LockedOccupiedEntry<Pointer = Self::Pointer> + 'c,
+        impl crate::LockedVacantEntry<Pointer = Self::Pointer> + 'c,
     >
     where
         T::Key: Borrow<K>,
         K: ?Sized + Hash + Eq,
     {
-        match self.inner.entry(key) {
-            crate::Entry::Occupied(occupied) => {
+        match self.inner.locked_entry(key) {
+            crate::LockedEntry::Occupied(occupied) => {
                 if occupied.value().expire_at() >= self.clock.now() {
-                    crate::Entry::Occupied(occupied)
+                    crate::LockedEntry::Occupied(occupied)
                 } else {
-                    crate::Entry::Vacant(Vacant(Some(VacantInner::Expired(occupied))))
+                    crate::LockedEntry::Vacant(Vacant(Some(VacantInner::Expired(occupied))))
                 }
             }
 
-            crate::Entry::Vacant(vacant) => {
-                crate::Entry::Vacant(Vacant(Some(VacantInner::Vacant(vacant))))
+            crate::LockedEntry::Vacant(vacant) => {
+                crate::LockedEntry::Vacant(Vacant(Some(VacantInner::Vacant(vacant))))
             }
+        }
+    }
+
+    fn entry<'c, 'k, K>(&'c self, key: &'k K) -> impl crate::Entry<Pointer = Self::Pointer> + 'c
+    where
+        <T as Value>::Key: Borrow<K>,
+        K: ?Sized + Hash + Eq,
+    {
+        ExpireEntry {
+            entry: self.0.entry(key), 
+            expired: |v| v.is_expired()
         }
     }
 }
@@ -165,8 +245,8 @@ where
 // #[derive(Debug, Default)]
 // pub struct ExpireAtIntrusive<C>(C);
 
-// impl<T, C> Layer<ExpiryTimeValue<T, C>> for ExpireAtIntrusive<C> 
-// where 
+// impl<T, C> Layer<ExpiryTimeValue<T, C>> for ExpireAtIntrusive<C>
+// where
 //     T: Value + ExpiryTime,
 //     C: Clock + Clone,
 // {
@@ -182,19 +262,19 @@ where
 //     }
 // }
 
-// impl<C: BuildCache<ExpiryTimeValue<T, Clk>>, T: Value + ExpiryTime, Clk> CacheLayer<C, T> for ExpireAtIntrusive<Clk> 
-// where 
-//     C: BuildCache<ExpiryTimeValue<T, Clk>>, 
-//     T: Value + ExpiryTime, 
+// impl<C: BuildCache<ExpiryTimeValue<T, Clk>>, T: Value + ExpiryTime, Clk> CacheLayer<C, T> for ExpireAtIntrusive<Clk>
+// where
+//     C: BuildCache<ExpiryTimeValue<T, Clk>>,
+//     T: Value + ExpiryTime,
 //     Clk: Clock + Clone,
 // {
 //     fn layer(self, inner: C) -> impl BuildCache<T> {
 //         struct Build<C, Clk>(C, Clk);
 
-//         impl<C: BuildCache<ExpiryTimeValue<T, Clk>>, T: Value + ExpiryTime, Clk> BuildCache<T> for Build<C, Clk> 
+//         impl<C: BuildCache<ExpiryTimeValue<T, Clk>>, T: Value + ExpiryTime, Clk> BuildCache<T> for Build<C, Clk>
 //         where
-//             C: BuildCache<ExpiryTimeValue<T, Clk>>, 
-//             T: Value + ExpiryTime, 
+//             C: BuildCache<ExpiryTimeValue<T, Clk>>,
+//             T: Value + ExpiryTime,
 //             Clk: Clock + Clone,
 //         {
 //             fn build(self) -> impl Cache<T> {
@@ -211,8 +291,8 @@ where
 //     }
 // }
 
-// pub(crate) fn expire_at_intrusive<T, C>(cache: impl Cache<ExpiryTimeValue<T, C>>, clock: C) -> impl Cache<T> 
-// where 
+// pub(crate) fn expire_at_intrusive<T, C>(cache: impl Cache<ExpiryTimeValue<T, C>>, clock: C) -> impl Cache<T>
+// where
 //     T: Value + ExpiryTime,
 //     C: Clock + Clone
 // {

@@ -89,16 +89,18 @@ where
 {
     type Pointer = Pointer<T, Ev>;
 
+    const PREFER_LOCKED: bool = true;
+
     fn len(&self) -> usize {
         self.table.borrow().len()
     }
 
-    fn entry<'c, 'k, K>(
+    fn locked_entry<'c, 'k, K>(
         &'c self,
         key: &'k K,
-    ) -> crate::Entry<
-        impl crate::OccupiedEntry<Pointer = Self::Pointer> + 'c,
-        impl crate::VacantEntry<Pointer = Self::Pointer> + 'c,
+    ) -> crate::LockedEntry<
+        impl crate::LockedOccupiedEntry<Pointer = Self::Pointer> + 'c,
+        impl crate::LockedVacantEntry<Pointer = Self::Pointer> + 'c,
     >
     where
         T::Key: Borrow<K>,
@@ -112,16 +114,24 @@ where
         );
 
         match found {
-            Ok(bucket) => crate::Entry::Occupied(OccupiedEntry(Some(OccupiedEntryInner {
+            Ok(bucket) => crate::LockedEntry::Occupied(OccupiedEntry(Some(OccupiedEntryInner {
                 cache: self,
                 bucket,
             }))),
-            Err(slot) => crate::Entry::Vacant(VacantEntry {
+            Err(slot) => crate::LockedEntry::Vacant(VacantEntry {
                 cache: self,
                 slot,
                 hash,
             }),
         }
+    }
+
+    fn entry<'c, 'k, K>(&'c self, key: &'k K) -> impl crate::Entry<Pointer = Self::Pointer> + 'c
+        where
+            <T as crate::Value>::Key: Borrow<K>,
+            K: ?Sized + Hash + std::cmp::Eq + ToOwned<Owned = <T as crate::Value>::Key> 
+    {
+        
     }
 }
 
@@ -162,7 +172,7 @@ impl<T: crate::Value, E, Ev, Es, S> OccupiedEntryInner<'_, T, E, Ev, Es, S> {
     }
 }
 
-impl<T, E, Ev, Es, S> crate::OccupiedEntry for OccupiedEntry<'_, T, E, Ev, Es, S>
+impl<T, E, Ev, Es, S> crate::LockedOccupiedEntry for OccupiedEntry<'_, T, E, Ev, Es, S>
 where
     T: crate::Value + 'static,
     E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Es>,
@@ -234,7 +244,7 @@ struct VacantEntry<'a, T, E, Ev, Eq, S> {
     hash: u64,
 }
 
-impl<T, E, Ev, Eq, S> crate::VacantEntry for VacantEntry<'_, T, E, Ev, Eq, S>
+impl<T, E, Ev, Eq, S> crate::LockedVacantEntry for VacantEntry<'_, T, E, Ev, Eq, S>
 where
     T: crate::Value + 'static,
     E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Eq>,

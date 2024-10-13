@@ -22,13 +22,13 @@ impl<K, V, C> MapCache<K, V, C> {
 
 pub struct MapEntry<K, V>(K, V);
 
-impl<K: Eq + Hash, V> crate::Value for MapEntry<K, V> {
-    type Key = K;
+// impl<K: Eq + Hash + ToOwned, V> crate::Value for MapEntry<K, V> {
+//     type Key = K;
 
-    fn key(&self) -> &Self::Key {
-        &self.0
-    }
-}
+//     fn key(&self) -> &Self::Key {
+//         &self.0
+//     }
+// }
 
 #[derive(Debug, Clone)]
 pub struct MapPointer<P>(P);

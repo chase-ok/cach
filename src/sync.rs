@@ -19,7 +19,7 @@ use crate::{
     build::BuildCache,
     evict::{Eviction, NoEviction},
     lock::MapUpgradeReadGuard,
-    Cache,
+    Cache, Mutate, Mutated, 
 };
 
 pub const MAX_SHARDS: usize = 2048;
@@ -176,6 +176,8 @@ where
 {
     type Pointer = Pointer<T, Ev>;
 
+    const PREFER_LOCKED: bool = true;
+
     fn len(&self) -> usize {
         self.shards
             .iter()
@@ -202,12 +204,12 @@ where
         Some(pointer)
     }
 
-    fn entry<'c, 'k, K>(
+    fn locked_entry<'c, 'k, K>(
         &'c self,
         key: &'k K,
-    ) -> crate::Entry<
-        impl crate::OccupiedEntry<Pointer = Self::Pointer> + 'c,
-        impl crate::VacantEntry<Pointer = Self::Pointer> + 'c,
+    ) -> crate::LockedEntry<
+        impl crate::LockedOccupiedEntry<Pointer = Self::Pointer> + 'c,
+        impl crate::LockedVacantEntry<Pointer = Self::Pointer> + 'c,
     >
     where
         T::Key: Borrow<K>,
@@ -222,17 +224,39 @@ where
             |p| self.hash_builder.hash_one(p.key()),
         );
         match found {
-            Ok(bucket) => crate::Entry::Occupied(OccupiedEntry(Some(OccupiedEntryInner {
+            Ok(bucket) => crate::LockedEntry::Occupied(OccupiedEntry(Some(OccupiedEntryInner {
                 cache: self,
                 shard,
                 bucket,
             }))),
-            Err(slot) => crate::Entry::Vacant(VacantEntry {
+            Err(slot) => crate::LockedEntry::Vacant(VacantEntry {
                 cache: self,
                 shard,
                 slot,
                 hash,
             }),
+        }
+    }
+
+    fn entry<'c, 'k, K>(&'c self, key: &'k K) -> impl crate::Entry<Pointer = Self::Pointer> + 'c
+    where
+        <T as crate::Value>::Key: Borrow<K>,
+        K: ?Sized + Hash + std::cmp::Eq + ToOwned<Owned = <T as crate::Value>::Key>,
+    {
+        let (hash, shard) = self.hash_and_shard(key);
+        let current = self.shards[shard]
+            .read()
+            .values
+            .get(hash, |p| p.0.value.key().borrow() == key)
+            .cloned();
+        Entry {
+            cache: self,
+            current: match current {
+                Some(o) => EntryState::Occupied(o),
+                None => EntryState::Vacant(key.to_owned()),
+            },
+            shard,
+            hash,
         }
     }
 }
@@ -285,7 +309,7 @@ impl<T: crate::Value, E, Ev, Es, S> OccupiedEntryInner<'_, T, E, Ev, Es, S> {
     }
 }
 
-impl<T, E, Ev, Es, S> crate::OccupiedEntry for OccupiedEntry<'_, T, E, Ev, Es, S>
+impl<T, E, Ev, Es, S> crate::LockedOccupiedEntry for OccupiedEntry<'_, T, E, Ev, Es, S>
 where
     T: crate::Value + 'static,
     E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Es>,
@@ -351,7 +375,7 @@ struct VacantEntry<'a, T, E, Ev, Eq, S> {
     hash: u64,
 }
 
-impl<T, E, Ev, Eq, S> crate::VacantEntry for VacantEntry<'_, T, E, Ev, Eq, S>
+impl<T, E, Ev, Eq, S> crate::LockedVacantEntry for VacantEntry<'_, T, E, Ev, Eq, S>
 where
     T: crate::Value + 'static,
     E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
@@ -389,5 +413,153 @@ where
         }
 
         insert
+    }
+}
+
+struct Entry<'a, T: crate::Value, E, Ev, Eq, S> {
+    cache: &'a SyncCache<T, E, Ev, Eq, S>,
+    current: EntryState<T, Ev>,
+    shard: usize,
+    hash: u64,
+}
+
+enum EntryState<T: crate::Value, Ev> {
+    Occupied(Pointer<T, Ev>),
+    Removed(Pointer<T, Ev>),
+    Vacant(T::Key),
+}
+
+impl<T, E, Ev, Es, S> crate::Entry for Entry<'_, T, E, Ev, Es, S>
+where
+    T: crate::Value + 'static,
+    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Es>,
+    S: BuildHasher,
+{
+    type Pointer = Pointer<T, Ev>;
+
+    fn value(&self) -> Option<&T> {
+        match &self.current {
+            EntryState::Occupied(pointer) => Some(&**pointer),
+            _ => None,
+        }
+    }
+
+    fn pointer(&self) -> Option<Self::Pointer> {
+        match &self.current {
+            EntryState::Occupied(pointer) => Some(pointer.clone()),
+            _ => None,
+        }
+    }
+
+    fn key(&self) -> &T::Key {
+        match &self.current {
+            EntryState::Occupied(pointer) | EntryState::Removed(pointer) => pointer.key(),
+            EntryState::Vacant(key) => &key,
+        }
+    }
+
+    fn try_mutate(&mut self, mutate: Mutate<T>) -> Result<Mutated<Self::Pointer>, Mutate<T>> {
+        match (&self.current, mutate) {
+            // Occupied, but unchanged?
+            (EntryState::Occupied(current), Mutate::None) => {
+                let next = self.cache.shards[self.shard]
+                    .read()
+                    .values
+                    .get(self.hash, |p| Arc::ptr_eq(&p.0, &current.0) || p.key() == current.key())
+                    .cloned();
+
+                match next {
+                    Some(next) if Arc::ptr_eq(&current.0, &next.0) => Ok(Mutated::None(Some(next))),
+                    Some(next) => {
+                        self.current = EntryState::Occupied(next);
+                        Err(Mutate::None)
+                    }
+                    None => {
+                        // XX: make swap method that doesn't require clone
+                        self.current = EntryState::Removed(current.clone());
+                        Err(Mutate::None)
+                    }
+                }
+            }
+
+            // Removed, but unchanged?
+            (EntryState::Removed(current), Mutate::None) => {
+                let next = self.cache.shards[self.shard]
+                    .read()
+                    .values
+                    .get(self.hash, |p| Arc::ptr_eq(&p.0, &current.0) || p.key() == current.key())
+                    .cloned();
+
+                match next {
+                    Some(next) => {
+                        self.current = EntryState::Occupied(next);
+                        Err(Mutate::None)
+                    }
+                    None => {
+                        Ok(Mutated::None(None))
+                    }
+                }
+            }
+
+            // Vacant, but unchanged?
+            (EntryState::Vacant(key), Mutate::None) => {
+                let next = self.cache.shards[self.shard]
+                    .read()
+                    .values
+                    .get(self.hash, |p| p.key() == key)
+                    .cloned();
+
+                match next {
+                    Some(next) => {
+                        self.current = EntryState::Occupied(next);
+                        Err(Mutate::None)
+                    }
+                    None => {
+                        Ok(Mutated::None(None))
+                    }
+                }
+            }
+
+            // Write to occupied
+            (EntryState::Occupied(current), mutate @ (Mutate::Write(_) | Mutate::Remove)) => {
+                let mut shard = self.cache.shards[self.shard].write();
+                let found = shard.values.find(
+                    self.hash, 
+                    |p| Arc::ptr_eq(&p.0, &current.0) || p.key() == current.key(),
+                );
+
+                if let Some(bucket) = found {
+                    // XX safety
+                    let next = unsafe { bucket.as_mut() };
+                    if Arc::ptr_eq(&next.0, &current.0) {
+                        match mutate {
+                            Mutate::Write(value) => {
+                                // let replaced = std::mem::replace(next, );
+                                todo!()
+                            }
+                            Mutate::Remove => {
+                                drop(next);
+                                // XX safety
+                                unsafe { shard.values.remove(bucket); }
+                                let removed = current.clone();
+                                self.current = EntryState::Removed(current.clone());
+                                Ok(Mutated::Removed(removed))
+                            }
+                            _ => unreachable!()
+                        }
+                    } else {
+                        self.current = EntryState::Occupied(next.clone());
+                        Err(mutate)
+                    }
+                } else {
+                    self.current = EntryState::Removed(current.clone());
+                    Err(mutate)
+                }
+            }
+
+            _ => todo!()
+            // (Err(_), Mutate::Write(_)) => todo!(),
+            // (Err(_), Mutate::Remove) => todo!(),
+        }
     }
 }
