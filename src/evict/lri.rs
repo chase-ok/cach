@@ -24,12 +24,12 @@ impl<P: Clone> Eviction<P> for EvictLeastRecentlyInserted {
         construct: impl FnOnce(Self::Value) -> P,
     ) -> (P, impl Iterator<Item = P>) {
         let removed = if shard.len() == shard.capacity() {
-            shard.head_key().and_then(|k| shard.remove(k))
+            shard.pop_head()
         } else {
             None
         };
 
-        let (_key, value) = shard.insert_tail_with_key(construct);
+        let (_key, value) = shard.push_tail_with_key(construct);
         (value.clone(), removed.into_iter())
     }
 
@@ -52,7 +52,7 @@ impl<P: Clone> Eviction<P> for EvictLeastRecentlyInserted {
         construct: impl FnOnce(Self::Value) -> P,
     ) -> (P, impl Iterator<Item = P>) {
         shard.remove(*remove).unwrap();
-        let (_key, value) = shard.insert_tail_with_key(construct);
+        let (_key, value) = shard.push_tail_with_key(construct);
         (value.clone(), std::iter::empty())
     }
 }
@@ -77,7 +77,7 @@ where
         queue: &mut Self::Queue,
         construct: impl FnOnce(Self::Value) -> P,
     ) -> (P, impl Iterator<Item = P>) {
-        let (_key, value) = queue.insert_tail_with_key(construct);
+        let (_key, value) = queue.push_tail_with_key(construct);
         (
             value.clone(),
             drain_expired(queue, self.0.now())
@@ -103,7 +103,7 @@ where
         construct: impl FnOnce(Self::Value) -> P,
     ) -> (P, impl Iterator<Item = P>) {
         queue.remove(*remove).unwrap();
-        let (_key, value) = queue.insert_tail_with_key(construct);
+        let (_key, value) = queue.push_tail_with_key(construct);
         (
             value.clone(),
             drain_expired(queue, self.0.now())
@@ -111,7 +111,7 @@ where
     }
 }
 
-fn drain_expired<P>(queue: &mut IndexList<P>, now: Instant) -> impl Iterator<Item = P>
+fn drain_expired<P>(queue: &mut IndexList<P>, now: Instant) -> impl Iterator<Item = P> + '_
 where
     P: Clone + Deref,
     P::Target: ExpireAt,

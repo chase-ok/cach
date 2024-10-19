@@ -7,4 +7,5 @@ edition = "2021"
 crossbeam-utils = "0.8.20"
 hashbrown = { version = "0.14.5", features = ["raw"] }
 parking_lot = "0.12.3"
+scc = "2.2.1"
 smallvec = { version = "1.13.2", features = ["union", "const_generics"] }

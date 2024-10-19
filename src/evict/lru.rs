@@ -24,12 +24,12 @@ impl<P: Clone> Eviction<P> for EvictLeastRecentlyUsed {
         construct: impl FnOnce(Self::Value) -> P,
     ) -> (P, impl Iterator<Item = P>) {
         let removed = if shard.len() == shard.capacity() {
-            shard.head_key().and_then(|k| shard.remove(k))
+            shard.pop_head()
         } else {
             None
         };
 
-        let (_key, value) = shard.insert_tail_with_key(construct);
+        let (_key, value) = shard.push_tail_with_key(construct);
         (value.clone(), removed.into_iter())
     }
 
@@ -48,19 +48,19 @@ impl<P: Clone> Eviction<P> for EvictLeastRecentlyUsed {
         construct: impl FnOnce(Self::Value) -> P,
     ) -> (P, impl Iterator<Item = P>) {
         queue.remove(*remove).unwrap();
-        let (_key, value) = queue.insert_tail_with_key(construct);
+        let (_key, value) = queue.push_tail_with_key(construct);
         (value.clone(), std::iter::empty())
     }
 }
 
 #[derive(Debug)]
-pub struct ApproxLeastRecentlyUsedEviction<C = DefaultClock> {
+pub struct EvictApproxLeastRecentlyUsed<C = DefaultClock> {
     clock: C,
     soft_window: Duration,
     hard_window: Duration,
 }
 
-impl<C: Default> ApproxLeastRecentlyUsedEviction<C> {
+impl<C: Default> EvictApproxLeastRecentlyUsed<C> {
     pub fn new(soft_window: Duration) -> Self {
         Self::with_hard_window(soft_window, soft_window * 2)
     }
@@ -70,7 +70,7 @@ impl<C: Default> ApproxLeastRecentlyUsedEviction<C> {
     }
 }
 
-impl<C> ApproxLeastRecentlyUsedEviction<C> {
+impl<C> EvictApproxLeastRecentlyUsed<C> {
     pub fn with_clock(soft_window: Duration, hard_window: Duration, clock: C) -> Self {
         Self {
             clock,
@@ -80,7 +80,7 @@ impl<C> ApproxLeastRecentlyUsedEviction<C> {
     }
 }
 
-impl<C: Clock, P: Clone> Eviction<P> for ApproxLeastRecentlyUsedEviction<C> {
+impl<C: Clock, P: Clone> Eviction<P> for EvictApproxLeastRecentlyUsed<C> {
     type Value = (AtomicInstant, <EvictLeastRecentlyUsed as Eviction<P>>::Value);
     type Queue = <EvictLeastRecentlyUsed as Eviction<P>>::Queue;
 
@@ -129,13 +129,13 @@ impl<C: Clock, P: Clone> Eviction<P> for ApproxLeastRecentlyUsedEviction<C> {
 }
 
 #[derive(Debug)]
-pub struct ApproxLeastRecentlyUsedIntrusiveEviction<C = DefaultClock> {
+pub struct EvictApproxLeastRecentlyUsedIntrusive<C = DefaultClock> {
     clock: C,
     soft_window: Duration,
     hard_window: Duration,
 }
 
-impl<C: Default> ApproxLeastRecentlyUsedIntrusiveEviction<C> {
+impl<C: Default> EvictApproxLeastRecentlyUsedIntrusive<C> {
     pub fn new(soft_window: Duration) -> Self {
         Self::with_hard_window(soft_window, soft_window * 2)
     }
@@ -145,7 +145,7 @@ impl<C: Default> ApproxLeastRecentlyUsedIntrusiveEviction<C> {
     }
 }
 
-impl<C> ApproxLeastRecentlyUsedIntrusiveEviction<C> {
+impl<C> EvictApproxLeastRecentlyUsedIntrusive<C> {
     pub fn with_clock(soft_window: Duration, hard_window: Duration, clock: C) -> Self {
         Self {
             clock,
@@ -155,7 +155,7 @@ impl<C> ApproxLeastRecentlyUsedIntrusiveEviction<C> {
     }
 }
 
-impl<C, P> Eviction<P> for ApproxLeastRecentlyUsedIntrusiveEviction<C>
+impl<C, P> Eviction<P> for EvictApproxLeastRecentlyUsedIntrusive<C>
 where 
     C: Clock,
     P: Deref + Clone,
