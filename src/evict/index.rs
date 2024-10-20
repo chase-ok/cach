@@ -1,117 +1,74 @@
-use std::{
-    num::NonZero,
-    sync::atomic::{AtomicU32, Ordering},
-};
-
-use crossbeam_utils::Backoff;
+use std::num::NonZero;
 
 pub struct IndexList<T> {
     nodes: Vec<Node<T>>,
-    head: AtomicIndex,
-    tail: AtomicIndex,
     len: usize,
+    head: Option<Index>,
+    tail: Option<Index>,
     next_free: Option<Key>,
 }
 
 type IndexRepr = u32;
-type AtomicIndexRepr = AtomicU32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Index(IndexRepr);
-
-const UNSET: IndexRepr = 1 << (IndexRepr::BITS - 1);
-const DELETED: IndexRepr = 1 << (IndexRepr::BITS - 2);
-const INDEX_MASK: IndexRepr = !DELETED & !UNSET;
+struct Index(NonZero<IndexRepr>);
 
 impl Index {
-    fn from_repr(x: IndexRepr) -> Option<Self> {
-        if x & UNSET > 0 {
-            None
-        } else {
-            Some(Self(x))
-        }
-    }
+    const MAX: Self = Self(NonZero::<IndexRepr>::MAX);
 
-    fn to_repr(this: Option<Self>) -> IndexRepr {
-        match this {
-            Some(Self(x)) => {
-                debug_assert_eq!(x & UNSET, 0);
-                x
-            }
-            None => UNSET,
-        }
-    }
-
-    fn new(mut offset: IndexRepr, deleted: bool) -> Self {
-        debug_assert_eq!(offset & UNSET, 0);
-        debug_assert_eq!(offset & DELETED, 0);
-        if deleted {
-            offset |= DELETED;
-        }
-        Self(offset)
-    }
-
-    fn offset(self) -> IndexRepr {
-        self.0 & INDEX_MASK
-    }
-
-    fn is_deleted(self) -> bool {
-        self.0 & DELETED > 0
-    }
-
-    fn delete(self) -> Self {
-        Self(self.0 | DELETED)
+    fn into_usize(self) -> usize {
+        self.into()
     }
 }
 
-#[derive(Debug)]
-struct AtomicIndex(AtomicIndexRepr);
-
-impl AtomicIndex {
-    const fn unset() -> Self {
-        Self(AtomicIndexRepr::new(UNSET))
-    }
-    
-    fn new(index: Option<Index>) -> Self {
-        Self(AtomicIndexRepr::new(Index::to_repr(index)))
-    }
-
-    fn load(&self, order: Ordering) -> Option<Index> {
-        Index::from_repr(self.0.load(order))
-    }
-
-    fn store(&self, index: Option<Index>, order: Ordering) {
-        self.0.store(Index::to_repr(index), order);
-    }
-
-    fn get(&mut self) -> Option<Index> {
-        Index::from_repr(*self.0.get_mut())
-    }
-    
-    fn set(&mut self, index: Option<Index>) {
-        *self.0.get_mut() = Index::to_repr(index);
+impl From<usize> for Index {
+    fn from(index: usize) -> Self {
+        let bumped = index.checked_add(1).unwrap();
+        let as_repr = IndexRepr::try_from(bumped).unwrap();
+        Self(NonZero::new(as_repr).unwrap())
     }
 }
 
-type Gen = NonZero<u32>;
-const START_GEN: Gen = Gen::MIN;
+impl From<Index> for usize {
+    fn from(index: Index) -> Self {
+        let index = index.0.get() - 1;
+        index.try_into().unwrap()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Generation(NonZero<u32>);
+
+impl Generation {
+    const fn initial() -> Self {
+        Self(NonZero::<u32>::MIN)
+    }
+
+    fn increment(self) -> Self {
+        self.0.checked_add(1).map(Self).unwrap_or(Self::initial())
+    }
+
+    fn increment_mut(&mut self) {
+        *self = self.increment();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Key {
-    offset: IndexRepr,
-    gen: Gen,
+    index: Index,
+    gen: Generation,
 }
 
 struct Node<T> {
     state: NodeState<T>,
-    gen: Gen,
+    gen: Generation,
 }
 
 enum NodeState<T> {
     Occupied {
         value: T,
-        prev: AtomicIndex,
-        next: AtomicIndex,
+        prev: Option<Index>,
+        next: Option<Index>,
     },
     Vacant {
         next_free: Option<Key>,
@@ -120,13 +77,13 @@ enum NodeState<T> {
 
 impl<T> IndexList<T> {
     pub fn with_capacity(capacity: usize) -> Self {
-        assert!(capacity & (!INDEX_MASK) as usize == 0, "capacity overflow");
+        assert!(capacity <= Index::MAX.into(), "capacity too large");
 
         Self {
             nodes: Vec::with_capacity(capacity),
-            head: AtomicIndex::unset(),
-            tail: AtomicIndex::unset(),
             len: 0,
+            head: None,
+            tail: None,
             next_free: None,
         }
     }
@@ -140,25 +97,29 @@ impl<T> IndexList<T> {
     }
 
     pub fn push_tail_with_key(&mut self, value: impl FnOnce(Key) -> T) -> (Key, &T) {
-        let tail = self.tail.get();
+        let tail = self.tail;
         let node_state = |value| NodeState::Occupied {
             value,
-            prev: AtomicIndex::unset(),
-            next: AtomicIndex::new(tail),
+            prev: None,
+            next: tail,
         };
 
         let key = match self.next_free {
             None => {
-                let offset = self.nodes.len().try_into().expect("out of capacity");
-                let gen = START_GEN;
-                let key = Key { offset, gen };
+                assert!(self.nodes.len() < Index::MAX.into(), "out of capacity");
+
+                let gen = Generation::initial();
+                let key = Key {
+                    index: self.nodes.len().into(),
+                    gen,
+                };
                 let state = node_state(value(key));
                 self.nodes.push(Node { state, gen });
                 key
             }
 
             Some(key) => {
-                let node = &mut self.nodes[key.offset as usize];
+                let node = &mut self.nodes[key.index.into_usize()];
                 assert_eq!(key.gen, node.gen);
 
                 self.next_free = match &node.state {
@@ -166,13 +127,13 @@ impl<T> IndexList<T> {
                     _ => unreachable!(),
                 };
 
-                node.gen = node.gen.checked_add(1).unwrap_or(START_GEN);
+                node.gen.increment_mut();
                 node.state = node_state(value(key));
                 key
             }
         };
 
-        let NodeState::Occupied { value, .. } = &self.nodes[key.offset as usize].state else {
+        let NodeState::Occupied { value, .. } = &self.nodes[key.index.into_usize()].state else {
             unreachable!()
         };
         (key, value)
@@ -183,20 +144,20 @@ impl<T> IndexList<T> {
     }
 
     pub fn pop_head(&mut self) -> Option<T> {
-        let index = self.head.get()?;
-        debug_assert!(!index.is_deleted());
-
+        let index = self.head?;
         self.remove(Key {
-            offset: index.offset(),
-            gen: self.nodes[index.offset() as usize].gen,
+            index,
+            gen: self.nodes[index.into_usize()].gen,
         })
     }
 
     pub fn remove(&mut self, key: Key) -> Option<T> {
-        let node = &mut self.nodes[key.offset as usize];
-        assert_eq!(node.gen, key.gen);
+        let node = self.nodes.get_mut(key.index.into_usize())?;
+        if node.gen != key.gen {
+            return None;
+        }
 
-        let NodeState::Occupied { value, mut prev, mut next } = std::mem::replace(
+        let NodeState::Occupied { value, prev, next } = std::mem::replace(
             &mut node.state,
             NodeState::Vacant {
                 next_free: self.next_free,
@@ -205,96 +166,73 @@ impl<T> IndexList<T> {
             unreachable!()
         };
 
-        let gen = node.gen.checked_add(1).unwrap_or(START_GEN);
-        node.gen = gen;
+        node.gen.increment_mut();
         self.next_free = Some(Key {
-            offset: key.offset,
-            gen,
+            index: key.index,
+            gen: node.gen,
         });
 
-        self.prune_link(prev.get(), next.get());
+        self.prune_link(prev, next);
 
         Some(value)
     }
 
     fn prune_link(&mut self, prev: Option<Index>, next: Option<Index>) {
         if let Some(next) = next {
-            debug_assert!(!next.is_deleted());
-            match &mut self.nodes[next.offset() as usize].state {
+            match &mut self.nodes[next.into_usize()].state {
                 NodeState::Occupied {
                     prev: next_prev, ..
-                } => next_prev.set(prev),
+                } => *next_prev = prev,
                 _ => unreachable!(),
             }
         } else {
-            self.head.set(prev);
+            self.head = prev;
         }
 
         if let Some(prev) = prev {
-            debug_assert!(!prev.is_deleted());
-            match &mut self.nodes[prev.offset() as usize].state {
+            match &mut self.nodes[prev.into_usize()].state {
                 NodeState::Occupied {
                     next: prev_next, ..
-                } => prev_next.set(next),
+                } => *prev_next = next,
                 _ => unreachable!(),
             }
         } else {
-            self.tail.set(next);
+            self.tail = next;
         }
     }
 
-    pub fn move_to_tail_locked(&mut self, key: Key) {
-        let node = &mut self.nodes[key.offset as usize];
-        assert_eq!(node.gen, key.gen);
+    pub fn move_to_tail(&mut self, key: Key) {
+        let Some(node) = self
+            .nodes
+            .get_mut(key.index.into_usize())
+            .filter(|n| n.gen == key.gen)
+        else {
+            return;
+        };
 
-        let current_tail = self.tail.get().unwrap();
-        debug_assert!(!current_tail.is_deleted());
-        if current_tail.offset() == key.offset {
+        let current_tail = self.tail.unwrap();
+        if current_tail == key.index {
             return;
         }
 
         let NodeState::Occupied { prev, next, .. } = &mut node.state else {
             unreachable!()
         };
-        let mut prev = std::mem::replace(prev, AtomicIndex::unset());
-        let mut next = std::mem::replace(next, AtomicIndex::new(Some(current_tail)));
-        self.prune_link(prev.get(), next.get());
+        let prev = std::mem::replace(prev, None);
+        let next = std::mem::replace(next, Some(current_tail));
+        self.prune_link(prev, next);
 
-        match &mut self.nodes[current_tail.offset() as usize].state {
+        match &mut self.nodes[current_tail.into_usize()].state {
             NodeState::Occupied { prev, .. } => {
-                prev.set(Some(Index::new(key.offset, false)));
+                *prev = Some(key.index);
             }
             _ => unreachable!(),
         }
     }
 
-    pub fn move_to_tail(&self, key: Key) {
-        let node = &self.nodes[key.offset as usize];
-        assert_eq!(node.gen, key.gen);
-        
-        let backoff = Backoff::new();
-        let mut current_tail = self.tail.load(Ordering::Relaxed).unwrap(); 
-        loop {
-            if !current_tail.is_deleted() {
-                if current_tail.offset() == key.offset {
-                    return;
-                }
-                
-                self.tail.compare_exchange_weak(Some(current_tail), Some(current_tail.delete()), Ordering::AcqRel, Ordering::Acquire)
-
-            }
-
-            let NodeState::Occupied { prev, next, .. } = &node.state else {
-                unreachable!()
-            };
-
-            backoff.spin();
-        }
-    }
-
     pub fn get(&self, key: Key) -> Option<&T> {
         self.nodes
-            .get(key.offset as usize)
+            .get(key.index.into_usize())
             .filter(|node| node.gen == key.gen)
             .and_then(|node| match &node.state {
                 NodeState::Occupied { value, .. } => Some(value),

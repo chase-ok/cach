@@ -17,7 +17,7 @@ use smallvec::SmallVec;
 
 use crate::{
     build::BuildCache,
-    evict::{Eviction, NoEviction},
+    evict::{Eviction, NoEviction, TouchLock},
     lock::MapUpgradeReadGuard,
     Cache,
 };
@@ -188,16 +188,33 @@ where
         T::Key: Borrow<K>,
         K: ?Sized + Hash + std::cmp::Eq,
     {
-        let (hash, shard) = self.hash_and_shard(key);
-        let shard = self.shards[shard].read();
-        let pointer = shard
-            .values
-            .get(hash, |p| p.0.value.key().borrow() == key)?
-            .clone();
 
-        let touch_guard = MapUpgradeReadGuard::new(shard, |s| &s.eviction, |s| &mut s.eviction);
-        self.eviction
-            .touch(touch_guard, &pointer.0.eviction, &pointer);
+        let (hash, shard) = self.hash_and_shard(key);
+        let pointer = match E::TOUCH_LOCK {
+            TouchLock::None | TouchLock::MayWrite => {
+                let shard = self.shards[shard].read();
+                let pointer = shard
+                    .values
+                    .get(hash, |p| p.0.value.key().borrow() == key)?
+                    .clone();
+
+                let touch_guard = MapUpgradeReadGuard::new(shard, |s| &s.eviction, |s| &mut s.eviction);
+                self.eviction
+                    .touch(touch_guard, &pointer.0.eviction, &pointer);
+
+                pointer
+            }
+
+            TouchLock::RequireWrite => {
+                let mut shard = self.shards[shard].write();
+                let pointer = shard
+                    .values
+                    .get(hash, |p| p.0.value.key().borrow() == key)?
+                    .clone();
+                self.eviction.touch(&mut shard.eviction, &pointer.0.eviction, &pointer);
+                pointer
+            }
+        };
 
         Some(pointer)
     }

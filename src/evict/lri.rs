@@ -5,7 +5,7 @@ use crate::expire::ExpireAt;
 use crate::time::{Clock, DefaultClock};
 
 use super::index::{IndexList, Key};
-use super::{Eviction, UpgradeReadGuard};
+use super::{Eviction, TouchLock, UpgradeReadGuard};
 
 #[derive(Debug)]
 pub struct EvictLeastRecentlyInserted;
@@ -13,6 +13,8 @@ pub struct EvictLeastRecentlyInserted;
 impl<P: Clone> Eviction<P> for EvictLeastRecentlyInserted {
     type Value = Key;
     type Queue = IndexList<P>;
+
+    const TOUCH_LOCK: TouchLock = TouchLock::None;
 
     fn new_queue(&mut self, capacity: usize) -> Self::Queue {
         IndexList::with_capacity(capacity)
@@ -67,6 +69,8 @@ where
 {
     type Value = Key;
     type Queue = IndexList<P>;
+
+    const TOUCH_LOCK: TouchLock = TouchLock::None;
 
     fn new_queue(&mut self, capacity: usize) -> Self::Queue {
         IndexList::with_capacity(capacity)

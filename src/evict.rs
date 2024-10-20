@@ -8,6 +8,8 @@ pub trait Eviction<P> {
     type Value;
     type Queue;
 
+    const TOUCH_LOCK: TouchLock;
+
     fn new_queue(&mut self, capacity: usize) -> Self::Queue;
 
     fn insert(
@@ -33,6 +35,13 @@ pub trait Eviction<P> {
     ) -> (P, impl Iterator<Item = P>);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchLock {
+    None,
+    MayWrite,
+    RequireWrite,
+}
+
 
 #[derive(Debug, Default)]
 pub struct NoEviction;
@@ -40,6 +49,8 @@ pub struct NoEviction;
 impl<P> Eviction<P> for NoEviction {
     type Value = ();
     type Queue = ();
+
+    const TOUCH_LOCK: TouchLock = TouchLock::None;
 
     fn new_queue(&mut self, _capacity: usize) -> Self::Queue {
         ()

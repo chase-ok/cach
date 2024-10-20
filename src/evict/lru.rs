@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::time::{AtomicInstant, Clock, DefaultClock, TouchedTime};
 
 use super::index::{IndexList, Key};
-use super::{Eviction, UpgradeReadGuard};
+use super::{Eviction, TouchLock, UpgradeReadGuard};
 
 #[derive(Debug)]
 pub struct EvictLeastRecentlyUsed;
@@ -13,6 +13,8 @@ pub struct EvictLeastRecentlyUsed;
 impl<P: Clone> Eviction<P> for EvictLeastRecentlyUsed {
     type Value = Key;
     type Queue = IndexList<P>;
+
+    const TOUCH_LOCK: TouchLock = TouchLock::RequireWrite;
 
     fn new_queue(&mut self, capacity: usize) -> Self::Queue {
         IndexList::with_capacity(capacity)
@@ -83,6 +85,8 @@ impl<C> EvictApproxLeastRecentlyUsed<C> {
 impl<C: Clock, P: Clone> Eviction<P> for EvictApproxLeastRecentlyUsed<C> {
     type Value = (AtomicInstant, <EvictLeastRecentlyUsed as Eviction<P>>::Value);
     type Queue = <EvictLeastRecentlyUsed as Eviction<P>>::Queue;
+
+    const TOUCH_LOCK: TouchLock = TouchLock::MayWrite;
 
     fn new_queue(&mut self, capacity: usize) -> Self::Queue {
         EvictLeastRecentlyUsed.new_queue(capacity)
@@ -163,6 +167,8 @@ where
 {
     type Value = <EvictLeastRecentlyUsed as Eviction<P>>::Value;
     type Queue = <EvictLeastRecentlyUsed as Eviction<P>>::Queue;
+
+    const TOUCH_LOCK: TouchLock = TouchLock::MayWrite;
 
     fn new_queue(&mut self, capacity: usize) -> Self::Queue {
         EvictLeastRecentlyUsed.new_queue(capacity)
