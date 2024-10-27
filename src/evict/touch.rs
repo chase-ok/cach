@@ -1,6 +1,6 @@
 use super::index::Key;
 use super::list::List;
-use super::{Evict, Point, TouchLock, UpgradeReadGuard};
+use super::{Evict, TouchLock, UpgradeReadGuard};
 
 #[derive(Debug)]
 pub struct EvictLeastRecentlyTouched;
@@ -15,35 +15,38 @@ impl<P: Clone> Evict<P> for EvictLeastRecentlyTouched {
         List::with_capacity(capacity)
     }
 
-    fn insert<Pt>(
+    fn insert(
         &self,
         queue: &mut Self::Queue,
         construct: impl FnOnce(Self::Value) -> P,
+        _deref: impl Fn(&P) -> &Self::Value,
     ) -> (P, impl Iterator<Item = P>) {
         let (value, removed) = queue.push_tail_with_key_and_pop_if_full(construct);
         (value.clone(), removed.into_iter())
     }
 
-    fn touch<Pt: Point<P, Self::Value>>(
+    fn touch(
         &self,
         queue: impl UpgradeReadGuard<Target = Self::Queue>,
         pointer: &P,
+        deref: impl Fn(&P) -> &Self::Value,
     ) {
-        UpgradeReadGuard::upgrade(queue).move_to_tail(*Pt::point(pointer));
+        UpgradeReadGuard::upgrade(queue).move_to_tail(*deref(pointer));
     }
 
-    fn remove<Pt: Point<P, Self::Value>>(&self, queue: &mut Self::Queue, pointer: &P) {
-        let removed = queue.remove(*Pt::point(pointer));
+    fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
+        let removed = queue.remove(*deref(pointer));
         debug_assert!(removed.is_some());
     }
 
-    fn replace<Pt: Point<P, Self::Value>>(
+    fn replace(
         &self,
         queue: &mut Self::Queue,
         pointer: &P,
         construct: impl FnOnce(Self::Value) -> P,
+        deref: impl Fn(&P) -> &Self::Value,
     ) -> (P, impl Iterator<Item = P>) {
-        let removed = queue.remove(*Pt::point(pointer));
+        let removed = queue.remove(*deref(pointer));
         debug_assert!(removed.is_some());
         let value = queue.push_tail_with_key(construct);
         (value.clone(), std::iter::empty())

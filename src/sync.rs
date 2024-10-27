@@ -18,7 +18,7 @@ use stable_deref_trait::{CloneStableDeref, StableDeref};
 
 use crate::{
     build::BuildCache,
-    evict::{Evict, EvictNone, Point, TouchLock},
+    evict::{Evict, EvictNone, TouchLock},
     lock::MapUpgradeReadGuard,
     Cache,
 };
@@ -169,16 +169,8 @@ impl<T, E> Deref for Pointer<T, E> {
 }
 
 // XX: just a wrapper around Arc<> that does impl Stable/Clone
-unsafe impl<T, E> StableDeref for Pointer<T, E> { }
-unsafe impl<T, E> CloneStableDeref for Pointer<T, E> { }
-
-struct PointEviction;
-
-impl<T, E> Point<Pointer<T, E>, E> for PointEviction {
-    fn point(pointer: &Pointer<T, E>) -> &E {
-        &pointer.0.eviction
-    }
-}
+unsafe impl<T, E> StableDeref for Pointer<T, E> {}
+unsafe impl<T, E> CloneStableDeref for Pointer<T, E> {}
 
 impl<T, E, Ev, Eq, S> Cache<T> for SyncCache<T, E, Ev, Eq, S>
 where
@@ -213,7 +205,7 @@ where
                 let touch_guard =
                     MapUpgradeReadGuard::new(shard, |s| &s.eviction, |s| &mut s.eviction);
                 self.eviction
-                    .touch::<PointEviction>(touch_guard, &pointer);
+                    .touch(touch_guard, &pointer, |p| &p.0.eviction);
 
                 pointer
             }
@@ -225,7 +217,7 @@ where
                     .get(hash, |p| p.0.value.key().borrow() == key)?
                     .clone();
                 self.eviction
-                    .touch::<PointEviction>(&mut shard.eviction, &pointer);
+                    .touch(&mut shard.eviction, &pointer, |p| &p.0.eviction);
                 pointer
             }
         };
@@ -304,7 +296,7 @@ where
             inner
                 .cache
                 .eviction
-                .touch::<PointEviction>(touch_guard, &pointer);
+                .touch(touch_guard, &pointer, |p| &p.0.eviction);
         }
     }
 }
@@ -341,10 +333,11 @@ where
         debug_assert!(value.key() == pointer.key());
 
         let (replace, evict) = {
-            let (replace, evict) = this.cache.eviction.replace::<PointEviction>(
+            let (replace, evict) = this.cache.eviction.replace(
                 &mut this.shard.eviction,
                 &pointer,
                 |eviction| Pointer(Arc::new(Value { value, eviction })),
+                |p| &p.0.eviction,
             );
             let evict = evict.collect::<SmallVec<[_; 8]>>();
             (replace, evict)
@@ -370,7 +363,7 @@ where
         inner
             .cache
             .eviction
-            .remove::<PointEviction>(&mut inner.shard.eviction, &removed);
+            .remove(&mut inner.shard.eviction, &removed, |p| &p.0.eviction);
         removed
     }
 }
@@ -394,12 +387,11 @@ where
         debug_assert_eq!(self.hash, self.cache.hash_builder.hash_one(value.key()));
 
         let (insert, evict) = {
-            let (insert, evict) = self
-                .cache
-                .eviction
-                .insert::<PointEviction>(&mut self.shard.eviction, |eviction| {
-                    Pointer(Arc::new(Value { value, eviction }))
-                });
+            let (insert, evict) = self.cache.eviction.insert(
+                &mut self.shard.eviction,
+                |eviction| Pointer(Arc::new(Value { value, eviction })),
+                |p| &p.0.eviction,
+            );
             let evict = evict.collect::<SmallVec<[_; 8]>>();
             (insert, evict)
         };

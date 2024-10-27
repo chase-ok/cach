@@ -5,7 +5,10 @@ use stable_deref_trait::CloneStableDeref;
 
 use crate::lock::UpgradeReadGuard;
 
-use super::{bag::{Bag, Key}, Evict, Point, TouchLock};
+use super::{
+    bag::{Bag, Key},
+    Evict, TouchLock,
+};
 
 pub struct EvictRandom<R = rand::rngs::SmallRng>(PhantomData<R>);
 
@@ -36,13 +39,14 @@ impl<P: CloneStableDeref, R: Rng + SeedableRng> Evict<P> for EvictRandom<R> {
         }
     }
 
-    fn insert<Pt: Point<P, Self::Value>>(
+    fn insert(
         &self,
         queue: &mut Self::Queue,
         construct: impl FnOnce(Self::Value) -> P,
+        deref: impl Fn(&P) -> &Self::Value,
     ) -> (P, impl Iterator<Item = P>) {
         let removed = if queue.bag.len() == queue.bag.capacity() {
-            queue.bag.pop::<Pt>(|len| queue.rng.gen_range(0..len))
+            queue.bag.pop(|len| queue.rng.gen_range(0..len), deref)
         } else {
             None
         };
@@ -51,19 +55,26 @@ impl<P: CloneStableDeref, R: Rng + SeedableRng> Evict<P> for EvictRandom<R> {
         (value.clone(), removed.into_iter())
     }
 
-    fn touch<Pt>(&self, _queue: impl UpgradeReadGuard<Target = Self::Queue>, _pointer: &P) { }
-
-    fn remove<Pt: Point<P, Self::Value>>(&self, queue: &mut Self::Queue, pointer: &P) {
-        queue.bag.remove::<Pt>(pointer);
+    fn touch(
+        &self,
+        _queue: impl UpgradeReadGuard<Target = Self::Queue>,
+        _pointer: &P,
+        _deref: impl Fn(&P) -> &Self::Value,
+    ) {
     }
 
-    fn replace<Pt: Point<P, Self::Value>>(
+    fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
+        queue.bag.remove(pointer, deref);
+    }
+
+    fn replace(
         &self,
         queue: &mut Self::Queue,
         pointer: &P,
         construct: impl FnOnce(Self::Value) -> P,
+        deref: impl Fn(&P) -> &Self::Value,
     ) -> (P, impl Iterator<Item = P>) {
-        queue.bag.remove::<Pt>(pointer);
+        queue.bag.remove(pointer, deref);
         let value = queue.bag.insert_with_key(construct);
         (value.clone(), std::iter::empty())
     }

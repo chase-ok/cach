@@ -11,8 +11,8 @@ pub mod random;
 #[cfg(feature = "rand")]
 mod bag;
 
-mod list;
 mod index;
+mod list;
 
 pub use approx::EvictApproximate;
 
@@ -24,29 +24,31 @@ pub trait Evict<P> {
 
     fn new_queue(&mut self, capacity: usize) -> Self::Queue;
 
-    fn insert<Pt: Point<P, Self::Value>>(
+    fn insert(
         &self,
         queue: &mut Self::Queue,
         construct: impl FnOnce(Self::Value) -> P,
+        deref: impl Fn(&P) -> &Self::Value,
     ) -> (P, impl Iterator<Item = P>);
 
-    fn touch<Pt: Point<P, Self::Value>>(&self, queue: impl UpgradeReadGuard<Target = Self::Queue>, pointer: &P);
+    // XX: contract for stable deref?
 
-    fn remove<Pt: Point<P, Self::Value>>(&self, queue: &mut Self::Queue, pointer: &P);
+    fn touch(
+        &self,
+        queue: impl UpgradeReadGuard<Target = Self::Queue>,
+        pointer: &P,
+        deref: impl Fn(&P) -> &Self::Value,
+    );
 
-    fn replace<Pt: Point<P, Self::Value>>(
+    fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value);
+
+    fn replace(
         &self,
         queue: &mut Self::Queue,
         pointer: &P,
         construct: impl FnOnce(Self::Value) -> P,
+        deref: impl Fn(&P) -> &Self::Value,
     ) -> (P, impl Iterator<Item = P>);
-}
-
-// XX: requires stable deref to T
-
-#[doc(hidden)]
-pub trait Point<P, T: ?Sized> {
-    fn point(pointer: &P) -> &T;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,23 +71,31 @@ impl<P> Evict<P> for EvictNone {
         ()
     }
 
-    fn insert<Pt>(
+    fn insert(
         &self,
         _queue: &mut Self::Queue,
         construct: impl FnOnce(Self::Value) -> P,
+        _deref: impl Fn(&P) -> &Self::Value,
     ) -> (P, impl Iterator<Item = P>) {
         (construct(()), std::iter::empty())
     }
 
-    fn touch<Pt>(&self, _queue: impl UpgradeReadGuard<Target = Self::Queue>, _pointer: &P) {}
+    fn touch(
+        &self,
+        _queue: impl UpgradeReadGuard<Target = Self::Queue>,
+        _pointer: &P,
+        _deref: impl Fn(&P) -> &Self::Value,
+    ) {
+    }
 
-    fn remove<Pt>(&self, _queue: &mut Self::Queue, _pointer: &P) {}
+    fn remove(&self, _queue: &mut Self::Queue, _pointer: &P, _deref: impl Fn(&P) -> &Self::Value) {}
 
-    fn replace<Pt>(
+    fn replace(
         &self,
         _queue: &mut Self::Queue,
         _pointer: &P,
         construct: impl FnOnce(Self::Value) -> P,
+        _deref: impl Fn(&P) -> &Self::Value,
     ) -> (P, impl Iterator<Item = P>) {
         (construct(()), std::iter::empty())
     }

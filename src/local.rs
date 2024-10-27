@@ -7,7 +7,6 @@ use smallvec::SmallVec;
 use stable_deref_trait::{CloneStableDeref, StableDeref};
 use std::hash::Hash;
 
-use crate::evict::Point;
 use crate::{
     build::BuildCache,
     evict::{Evict, EvictNone},
@@ -86,14 +85,6 @@ impl<T, E> Deref for Pointer<T, E> {
 unsafe impl<T, E> StableDeref for Pointer<T, E> { }
 unsafe impl<T, E> CloneStableDeref for Pointer<T, E> { }
 
-struct PointEviction;
-
-impl<T, E> Point<Pointer<T, E>, E> for PointEviction {
-    fn point(pointer: &Pointer<T, E>) -> &E {
-        &pointer.0.eviction
-    }
-}
-
 impl<T, E, Ev, Eq, S> crate::Cache<T> for LocalCache<T, E, Ev, Eq, S>
 where
     T: crate::Value + 'static,
@@ -163,7 +154,7 @@ where
             inner
                 .cache
                 .eviction
-                .touch::<PointEviction>(&mut *inner.cache.queue.borrow_mut(), &pointer);
+                .touch(&mut *inner.cache.queue.borrow_mut(), &pointer, |p| &p.0.eviction);
         }
     }
 }
@@ -205,12 +196,12 @@ where
                 inner
                     .cache
                     .eviction
-                    .replace::<PointEviction>(&mut queue, &pointer, |eviction| {
+                    .replace(&mut queue, &pointer, |eviction| {
                         Pointer(Rc::new(Value {
                             inner: value,
                             eviction,
                         }))
-                    });
+                    }, |p| &p.0.eviction);
             let evict = evict.collect::<SmallVec<[_; 8]>>();
             (replace, evict)
         };
@@ -237,7 +228,7 @@ where
         inner
             .cache
             .eviction
-            .remove::<PointEviction>(&mut inner.cache.queue.borrow_mut(), &removed);
+            .remove(&mut inner.cache.queue.borrow_mut(), &removed, |p| &p.0.eviction);
         removed
     }
 }
@@ -264,12 +255,12 @@ where
             let (insert, evict) =
                 self.cache
                     .eviction
-                    .insert::<PointEviction>(&mut queue, |eviction| {
+                    .insert(&mut queue, |eviction| {
                         Pointer(Rc::new(Value {
                             inner: value,
                             eviction,
                         }))
-                    });
+                    }, |p| &p.0.eviction);
             let evict = evict.collect::<SmallVec<[_; 8]>>();
             (insert, evict)
         };

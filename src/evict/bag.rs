@@ -2,8 +2,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::evict::index::Index;
 
-use super::Point;
-
 pub(crate) struct Bag<T> {
     values: Vec<T>,
 }
@@ -33,28 +31,28 @@ impl<T> Bag<T> {
         &self.values[index]
     }
 
-    pub fn remove<Pt: Point<T, Key>>(&mut self, value: &T) -> T {
-        let key = Pt::point(value);
+    pub fn remove(&mut self, value: &T, deref: impl Fn(&T) -> &Key) -> T {
+        let key = deref(value);
         // XX: can use relaxed since we have &mut self
         let index = key.0.load(Ordering::Relaxed);
-        self.do_remove::<Pt>(index)
+        self.do_remove(index, deref)
     }
 
-    pub fn pop<Pt: Point<T, Key>>(&mut self, rand: impl FnOnce(usize) -> usize) -> Option<T> {
+    pub fn pop(&mut self, rand: impl FnOnce(usize) -> usize, deref: impl Fn(&T) -> &Key) -> Option<T> {
         if self.len() == 0 {
             return None
         }
 
         let index = rand(self.len());
         assert!(index < self.len());
-        Some(self.do_remove::<Pt>(index))
+        Some(self.do_remove(index, deref))
     }
 
-    fn do_remove<Pt: Point<T, Key>>(&mut self, index: usize) -> T {
+    fn do_remove(&mut self, index: usize, deref: impl Fn(&T) -> &Key) -> T {
         let removed = self.values.swap_remove(index);
         if let Some(moved) = self.values.get(index) {
             // XX: can used relaxed
-            Pt::point(moved).0.store(index, Ordering::Relaxed);
+            deref(moved).0.store(index, Ordering::Relaxed);
         }
         removed
     }

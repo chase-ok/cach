@@ -6,7 +6,7 @@ use crate::time::{Clock, DefaultClock};
 
 use super::index::Key;
 use super::list::List;
-use super::{Evict, Point, TouchLock, UpgradeReadGuard};
+use super::{Evict, TouchLock, UpgradeReadGuard};
 
 #[derive(Debug)]
 pub struct EvictLeastRecentlyInserted;
@@ -21,28 +21,30 @@ impl<P: Clone> Evict<P> for EvictLeastRecentlyInserted {
         List::with_capacity(capacity)
     }
 
-    fn insert<Pt>(
+    fn insert(
         &self,
         queue: &mut Self::Queue,
         construct: impl FnOnce(Self::Value) -> P,
+        _deref: impl Fn(&P) -> &Self::Value,
     ) -> (P, impl Iterator<Item = P>) {
         let (value, removed) = queue.push_tail_with_key_and_pop_if_full(construct);
         (value.clone(), removed.into_iter())
     }
 
-    fn touch<Pt>(&self, _queue: impl UpgradeReadGuard<Target = Self::Queue>, _pointer: &P) {}
+    fn touch(&self, _queue: impl UpgradeReadGuard<Target = Self::Queue>, _pointer: &P, _deref: impl Fn(&P) -> &Self::Value) {}
 
-    fn remove<Pt: Point<P, Self::Value>>(&self, queue: &mut Self::Queue, pointer: &P) {
-        queue.remove(*Pt::point(pointer)).unwrap();
+    fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
+        queue.remove(*deref(pointer)).unwrap();
     }
 
-    fn replace<Pt: Point<P, Self::Value>>(
+    fn replace(
         &self,
         queue: &mut Self::Queue,
         pointer: &P,
         construct: impl FnOnce(Self::Value) -> P,
+        deref: impl Fn(&P) -> &Self::Value,
     ) -> (P, impl Iterator<Item = P>) {
-        queue.remove(*Pt::point(pointer)).unwrap();
+        queue.remove(*deref(pointer)).unwrap();
         let value = queue.push_tail_with_key(construct);
         (value.clone(), std::iter::empty())
     }
@@ -65,29 +67,37 @@ where
         List::with_capacity(capacity)
     }
 
-    fn insert<Pt>(
+    fn insert(
         &self,
         queue: &mut Self::Queue,
         construct: impl FnOnce(Self::Value) -> P,
+        _deref: impl Fn(&P) -> &Self::Value,
     ) -> (P, impl Iterator<Item = P>) {
         let value = queue.push_tail_with_key(construct);
         (value.clone(), drain_expired(queue, self.0.now()))
     }
 
-    fn touch<Pt>(&self, _queue: impl UpgradeReadGuard<Target = Self::Queue>, _pointer: &P) {}
+    fn touch(
+        &self,
+        _queue: impl UpgradeReadGuard<Target = Self::Queue>,
+        _pointer: &P,
+        _deref: impl Fn(&P) -> &Self::Value,
+    ) {
+    }
 
-    fn remove<Pt: Point<P, Self::Value>>(&self, queue: &mut Self::Queue, pointer: &P) {
-        let removed = queue.remove(*Pt::point(pointer));
+    fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
+        let removed = queue.remove(*deref(pointer));
         debug_assert!(removed.is_some());
     }
 
-    fn replace<Pt: Point<P, Self::Value>>(
+    fn replace(
         &self,
         queue: &mut Self::Queue,
         pointer: &P,
         construct: impl FnOnce(Self::Value) -> P,
+        deref: impl Fn(&P) -> &Self::Value,
     ) -> (P, impl Iterator<Item = P>) {
-        queue.remove(*Pt::point(pointer)).unwrap();
+        queue.remove(*deref(pointer)).unwrap();
         let value = queue.push_tail_with_key(construct);
         (value.clone(), drain_expired(queue, self.0.now()))
     }
