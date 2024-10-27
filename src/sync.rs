@@ -14,10 +14,11 @@ use hashbrown::{
 };
 use parking_lot::{RwLock, RwLockWriteGuard};
 use smallvec::SmallVec;
+use stable_deref_trait::{CloneStableDeref, StableDeref};
 
 use crate::{
     build::BuildCache,
-    evict::{Eviction, NoEviction, TouchLock},
+    evict::{Evict, EvictNone, Point, TouchLock},
     lock::MapUpgradeReadGuard,
     Cache,
 };
@@ -25,7 +26,7 @@ use crate::{
 pub const MAX_SHARDS: usize = 2048;
 
 #[derive(Debug, Clone)]
-pub struct SyncCacheBuilder<E = NoEviction, Ev = (), Eq = (), S = DefaultHashBuilder> {
+pub struct SyncCacheBuilder<E = EvictNone, Ev = (), Eq = (), S = DefaultHashBuilder> {
     eviction: E,
     hash_builder: S,
     shards: usize,
@@ -98,7 +99,7 @@ impl<E, Ev, Eq, S> SyncCacheBuilder<E, Ev, Eq, S> {
 impl<T, E, Ev, Eq, S> BuildCache<T> for SyncCacheBuilder<E, Ev, Eq, S>
 where
     T: crate::Value + 'static,
-    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
+    E: Evict<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
     S: BuildHasher,
 {
     type Cache = SyncCache<T, E, Ev, Eq, S>;
@@ -167,11 +168,23 @@ impl<T, E> Deref for Pointer<T, E> {
     }
 }
 
+// XX: just a wrapper around Arc<> that does impl Stable/Clone
+unsafe impl<T, E> StableDeref for Pointer<T, E> { }
+unsafe impl<T, E> CloneStableDeref for Pointer<T, E> { }
+
+struct PointEviction;
+
+impl<T, E> Point<Pointer<T, E>, E> for PointEviction {
+    fn point(pointer: &Pointer<T, E>) -> &E {
+        &pointer.0.eviction
+    }
+}
+
 impl<T, E, Ev, Eq, S> Cache<T> for SyncCache<T, E, Ev, Eq, S>
 where
     T: crate::Value + 'static,
     T::Key: Hash + std::cmp::Eq,
-    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
+    E: Evict<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
     S: BuildHasher,
 {
     type Pointer = Pointer<T, Ev>;
@@ -188,7 +201,6 @@ where
         T::Key: Borrow<K>,
         K: ?Sized + Hash + std::cmp::Eq,
     {
-
         let (hash, shard) = self.hash_and_shard(key);
         let pointer = match E::TOUCH_LOCK {
             TouchLock::None | TouchLock::MayWrite => {
@@ -198,9 +210,10 @@ where
                     .get(hash, |p| p.0.value.key().borrow() == key)?
                     .clone();
 
-                let touch_guard = MapUpgradeReadGuard::new(shard, |s| &s.eviction, |s| &mut s.eviction);
+                let touch_guard =
+                    MapUpgradeReadGuard::new(shard, |s| &s.eviction, |s| &mut s.eviction);
                 self.eviction
-                    .touch(touch_guard, &pointer.0.eviction, &pointer);
+                    .touch::<PointEviction>(touch_guard, &pointer);
 
                 pointer
             }
@@ -211,7 +224,8 @@ where
                     .values
                     .get(hash, |p| p.0.value.key().borrow() == key)?
                     .clone();
-                self.eviction.touch(&mut shard.eviction, &pointer.0.eviction, &pointer);
+                self.eviction
+                    .touch::<PointEviction>(&mut shard.eviction, &pointer);
                 pointer
             }
         };
@@ -268,7 +282,7 @@ struct OccupiedEntry<'a, T: crate::Value, E, Ev, Eq, S>(
 )
 where
     T: crate::Value + 'static,
-    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Eq>;
+    E: Evict<Pointer<T, Ev>, Value = Ev, Queue = Eq>;
 
 struct OccupiedEntryInner<'a, T: crate::Value, E, Ev, Eq, S> {
     cache: &'a SyncCache<T, E, Ev, Eq, S>,
@@ -279,7 +293,7 @@ struct OccupiedEntryInner<'a, T: crate::Value, E, Ev, Eq, S> {
 impl<T, E, Ev, Eq, S> Drop for OccupiedEntry<'_, T, E, Ev, Eq, S>
 where
     T: crate::Value + 'static,
-    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
+    E: Evict<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
 {
     fn drop(&mut self) {
         if let Some(inner) = self.0.take() {
@@ -290,7 +304,7 @@ where
             inner
                 .cache
                 .eviction
-                .touch(touch_guard, &pointer.0.eviction, &pointer);
+                .touch::<PointEviction>(touch_guard, &pointer);
         }
     }
 }
@@ -305,7 +319,7 @@ impl<T: crate::Value, E, Ev, Es, S> OccupiedEntryInner<'_, T, E, Ev, Es, S> {
 impl<T, E, Ev, Es, S> crate::OccupiedEntry for OccupiedEntry<'_, T, E, Ev, Es, S>
 where
     T: crate::Value + 'static,
-    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Es>,
+    E: Evict<Pointer<T, Ev>, Value = Ev, Queue = Es>,
     S: BuildHasher,
 {
     type Pointer = Pointer<T, Ev>;
@@ -327,9 +341,9 @@ where
         debug_assert!(value.key() == pointer.key());
 
         let (replace, evict) = {
-            let (replace, evict) = this.cache.eviction.replace(
+            let (replace, evict) = this.cache.eviction.replace::<PointEviction>(
                 &mut this.shard.eviction,
-                &pointer.0.eviction,
+                &pointer,
                 |eviction| Pointer(Arc::new(Value { value, eviction })),
             );
             let evict = evict.collect::<SmallVec<[_; 8]>>();
@@ -356,7 +370,7 @@ where
         inner
             .cache
             .eviction
-            .remove(&mut inner.shard.eviction, &removed.0.eviction);
+            .remove::<PointEviction>(&mut inner.shard.eviction, &removed);
         removed
     }
 }
@@ -371,7 +385,7 @@ struct VacantEntry<'a, T, E, Ev, Eq, S> {
 impl<T, E, Ev, Eq, S> crate::VacantEntry for VacantEntry<'_, T, E, Ev, Eq, S>
 where
     T: crate::Value + 'static,
-    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
+    E: Evict<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
     S: BuildHasher,
 {
     type Pointer = Pointer<T, Ev>;
@@ -383,7 +397,7 @@ where
             let (insert, evict) = self
                 .cache
                 .eviction
-                .insert(&mut self.shard.eviction, |eviction| {
+                .insert::<PointEviction>(&mut self.shard.eviction, |eviction| {
                     Pointer(Arc::new(Value { value, eviction }))
                 });
             let evict = evict.collect::<SmallVec<[_; 8]>>();

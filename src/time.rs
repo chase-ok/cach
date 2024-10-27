@@ -1,5 +1,10 @@
-use std::{sync::{atomic::{AtomicU64, Ordering}, OnceLock}, time::{Duration, Instant}};
-
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
+    time::{Duration, Instant},
+};
 
 pub trait Clock {
     fn now(&self) -> Instant;
@@ -12,11 +17,6 @@ impl Clock for DefaultClock {
     fn now(&self) -> Instant {
         Instant::now()
     }
-}
-
-pub trait TouchedTime {
-    fn last_touched(&self) -> Instant;
-    fn touch(&self, now: Instant);
 }
 
 pub trait WrittenTime {
@@ -63,9 +63,28 @@ impl AtomicInstant {
     pub fn store(&self, value: Instant, order: Ordering) {
         self.0.store(instant_to_offset(value, zero()), order);
     }
-    
+
     pub fn swap(&self, value: Instant, order: Ordering) -> Instant {
         let zero = zero();
         offset_to_instant(self.0.swap(instant_to_offset(value, zero), order), zero)
+    }
+
+    pub fn compare_exchange(
+        &self,
+        current: Instant,
+        new: Instant,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Instant, Instant> {
+        let zero = zero();
+        self.0
+            .compare_exchange(
+                instant_to_offset(current, zero),
+                instant_to_offset(new, zero),
+                success,
+                failure,
+            )
+            .map(|o| offset_to_instant(o, zero))
+            .map_err(|o| offset_to_instant(o, zero))
     }
 }

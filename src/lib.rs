@@ -169,8 +169,8 @@ pub trait Value {
 #[test]
 fn test() {
     use build::{BuildCacheExt as _, BuildCache as _};
-    use evict::lru::EvictLeastRecentlyUsed;
-    use std::time::Instant;
+    use evict::touch::EvictLeastRecentlyTouched;
+    use std::time::{Duration, Instant};
 
     struct Test {
         key: String,
@@ -192,7 +192,8 @@ fn test() {
     }
 
     let cache = sync::SyncCacheBuilder::new()
-        .evict(evict::lri::EvictExpiredLeastRecentlyInserted::default())
+        .evict(
+            evict::EvictApproximate::with_window(evict::touch::EvictLeastRecentlyTouched, Duration::from_secs(1)))
         .expire_at()
         .build();
     // .expire_intrusive();

@@ -4,15 +4,17 @@ use std::{cell::RefCell, hash::BuildHasher, marker::PhantomData, ops::Deref, rc:
 use hashbrown::raw::{Bucket, InsertSlot};
 use hashbrown::{hash_map::DefaultHashBuilder, raw::RawTable};
 use smallvec::SmallVec;
+use stable_deref_trait::{CloneStableDeref, StableDeref};
 use std::hash::Hash;
 
+use crate::evict::Point;
 use crate::{
     build::BuildCache,
-    evict::{Eviction, NoEviction},
+    evict::{Evict, EvictNone},
 };
 
 #[derive(Debug, Clone)]
-pub struct LocalCacheBuilder<E = NoEviction, Ev = (), Eq = (), S = DefaultHashBuilder> {
+pub struct LocalCacheBuilder<E = EvictNone, Ev = (), Eq = (), S = DefaultHashBuilder> {
     eviction: E,
     hash_builder: S,
     capacity: Option<usize>,
@@ -33,7 +35,7 @@ impl<E: Default, Ev, Eq, S: Default> Default for LocalCacheBuilder<E, Ev, Eq, S>
 impl<T, E, Ev, Eq, S> BuildCache<T> for LocalCacheBuilder<E, Ev, Eq, S>
 where
     T: crate::Value + 'static,
-    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
+    E: Evict<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
     S: BuildHasher,
 {
     type Cache = LocalCache<T, E, Ev, Eq, S>;
@@ -80,11 +82,23 @@ impl<T, E> Deref for Pointer<T, E> {
     }
 }
 
+// XX: just a wrapper around Rc<> that does impl Stable/Clone
+unsafe impl<T, E> StableDeref for Pointer<T, E> { }
+unsafe impl<T, E> CloneStableDeref for Pointer<T, E> { }
+
+struct PointEviction;
+
+impl<T, E> Point<Pointer<T, E>, E> for PointEviction {
+    fn point(pointer: &Pointer<T, E>) -> &E {
+        &pointer.0.eviction
+    }
+}
+
 impl<T, E, Ev, Eq, S> crate::Cache<T> for LocalCache<T, E, Ev, Eq, S>
 where
     T: crate::Value + 'static,
     T::Key: Hash + std::cmp::Eq,
-    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
+    E: Evict<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
     S: BuildHasher,
 {
     type Pointer = Pointer<T, Ev>;
@@ -130,7 +144,7 @@ struct OccupiedEntry<'a, T: crate::Value, E, Ev, Eq, S>(
 )
 where
     T: crate::Value + 'static,
-    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Eq>;
+    E: Evict<Pointer<T, Ev>, Value = Ev, Queue = Eq>;
 
 struct OccupiedEntryInner<'a, T: crate::Value, E, Ev, Eq, S> {
     cache: &'a LocalCache<T, E, Ev, Eq, S>,
@@ -140,17 +154,16 @@ struct OccupiedEntryInner<'a, T: crate::Value, E, Ev, Eq, S> {
 impl<T, E, Ev, Eq, S> Drop for OccupiedEntry<'_, T, E, Ev, Eq, S>
 where
     T: crate::Value + 'static,
-    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
+    E: Evict<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
 {
     fn drop(&mut self) {
         if let Some(inner) = self.0.take() {
             // XX Safety
             let pointer = unsafe { inner.bucket.as_ref() };
-            inner.cache.eviction.touch(
-                &mut *inner.cache.queue.borrow_mut(),
-                &pointer.0.eviction,
-                &pointer,
-            );
+            inner
+                .cache
+                .eviction
+                .touch::<PointEviction>(&mut *inner.cache.queue.borrow_mut(), &pointer);
         }
     }
 }
@@ -165,7 +178,7 @@ impl<T: crate::Value, E, Ev, Es, S> OccupiedEntryInner<'_, T, E, Ev, Es, S> {
 impl<T, E, Ev, Es, S> crate::OccupiedEntry for OccupiedEntry<'_, T, E, Ev, Es, S>
 where
     T: crate::Value + 'static,
-    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Es>,
+    E: Evict<Pointer<T, Ev>, Value = Ev, Queue = Es>,
     S: BuildHasher,
 {
     type Pointer = Pointer<T, Ev>;
@@ -188,16 +201,16 @@ where
 
         let (replace, evict) = {
             let mut queue = inner.cache.queue.borrow_mut();
-            let (replace, evict) = inner.cache.eviction.replace(
-                &mut queue,
-                &pointer.0.eviction,
-                |eviction| {
-                    Pointer(Rc::new(Value {
-                        inner: value,
-                        eviction,
-                    }))
-                },
-            );
+            let (replace, evict) =
+                inner
+                    .cache
+                    .eviction
+                    .replace::<PointEviction>(&mut queue, &pointer, |eviction| {
+                        Pointer(Rc::new(Value {
+                            inner: value,
+                            eviction,
+                        }))
+                    });
             let evict = evict.collect::<SmallVec<[_; 8]>>();
             (replace, evict)
         };
@@ -206,7 +219,8 @@ where
         for evicted in evict {
             let key = evicted.key();
             let hash = inner.cache.hash_builder.hash_one(key);
-            inner.cache
+            inner
+                .cache
                 .table
                 .borrow_mut()
                 .remove_entry(hash, |p| Rc::ptr_eq(&p.0, &evicted.0));
@@ -223,7 +237,7 @@ where
         inner
             .cache
             .eviction
-            .remove(&mut inner.cache.queue.borrow_mut(), &removed.0.eviction);
+            .remove::<PointEviction>(&mut inner.cache.queue.borrow_mut(), &removed);
         removed
     }
 }
@@ -237,7 +251,7 @@ struct VacantEntry<'a, T, E, Ev, Eq, S> {
 impl<T, E, Ev, Eq, S> crate::VacantEntry for VacantEntry<'_, T, E, Ev, Eq, S>
 where
     T: crate::Value + 'static,
-    E: Eviction<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
+    E: Evict<Pointer<T, Ev>, Value = Ev, Queue = Eq>,
     S: BuildHasher,
 {
     type Pointer = Pointer<T, Ev>;
@@ -247,14 +261,15 @@ where
 
         let (insert, evict) = {
             let mut queue = self.cache.queue.borrow_mut();
-            let (insert, evict) = self.cache
-                .eviction
-                .insert(&mut queue, |eviction| {
-                    Pointer(Rc::new(Value {
-                        inner: value,
-                        eviction,
-                    }))
-                });
+            let (insert, evict) =
+                self.cache
+                    .eviction
+                    .insert::<PointEviction>(&mut queue, |eviction| {
+                        Pointer(Rc::new(Value {
+                            inner: value,
+                            eviction,
+                        }))
+                    });
             let evict = evict.collect::<SmallVec<[_; 8]>>();
             (insert, evict)
         };
