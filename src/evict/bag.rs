@@ -2,12 +2,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::evict::index::Index;
 
+use super::generation::AtomicTransfer;
+
 pub(crate) struct Bag<T> {
     values: Vec<T>,
 }
 
 #[doc(hidden)]
 pub struct Key(AtomicUsize);
+
+impl AtomicTransfer for Key {
+    fn atomic_transfer(self, other: &Self, order: Ordering) {
+        other.0.store(self.0.into_inner(), order);
+    }
+}
 
 impl<T> Bag<T> {
     pub fn with_capacity(capacity: usize) -> Self {
@@ -31,6 +39,12 @@ impl<T> Bag<T> {
         &self.values[index]
     }
 
+    pub fn insert(&mut self, value: T) -> Key {
+        let index = self.values.len();
+        self.values.push(value);
+        Key(index.into())
+    }
+
     pub fn remove(&mut self, value: &T, deref: impl Fn(&T) -> &Key) -> T {
         let key = deref(value);
         // XX: can use relaxed since we have &mut self
@@ -46,6 +60,10 @@ impl<T> Bag<T> {
         let index = rand(self.len());
         assert!(index < self.len());
         Some(self.do_remove(index, deref))
+    }
+
+    pub fn get(&self, key: &Key, order: Ordering) -> &T {
+        &self.values[key.0.load(order)]
     }
 
     fn do_remove(&mut self, index: usize, deref: impl Fn(&T) -> &Key) -> T {

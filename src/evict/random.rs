@@ -7,7 +7,7 @@ use crate::lock::UpgradeReadGuard;
 
 use super::{
     bag::{Bag, Key},
-    Evict, TouchLock,
+    Evict, TouchLockHint,
 };
 
 pub struct EvictRandom<R = rand::rngs::SmallRng>(PhantomData<R>);
@@ -29,7 +29,7 @@ impl<P: CloneStableDeref, R: Rng + SeedableRng> Evict<P> for EvictRandom<R> {
     type Value = Key;
     type Queue = Queue<P, R>;
 
-    const TOUCH_LOCK: TouchLock = TouchLock::None;
+    const TOUCH_LOCK_HINT: TouchLockHint = TouchLockHint::NoLock;
 
     fn new_queue(&mut self, capacity: usize) -> Self::Queue {
         assert!(capacity > 0);
@@ -65,17 +65,5 @@ impl<P: CloneStableDeref, R: Rng + SeedableRng> Evict<P> for EvictRandom<R> {
 
     fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
         queue.bag.remove(pointer, deref);
-    }
-
-    fn replace(
-        &self,
-        queue: &mut Self::Queue,
-        pointer: &P,
-        construct: impl FnOnce(Self::Value) -> P,
-        deref: impl Fn(&P) -> &Self::Value,
-    ) -> (P, impl Iterator<Item = P>) {
-        queue.bag.remove(pointer, deref);
-        let value = queue.bag.insert_with_key(construct);
-        (value.clone(), std::iter::empty())
     }
 }

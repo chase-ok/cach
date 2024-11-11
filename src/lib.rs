@@ -1,14 +1,20 @@
-use std::{borrow::Borrow, hash::Hash, ops::Deref};
+use std::{
+    borrow::Borrow,
+    hash::Hash,
+    ops::Deref,
+};
 
 pub mod build;
 pub mod evict;
 pub mod expire;
+pub mod local;
+pub mod lock;
 pub mod map;
 pub mod sync;
 pub mod time;
-pub mod lock;
-pub mod local;
+pub mod load;
 mod wrap;
+mod layer;
 
 use time::{Clock, DefaultClock};
 
@@ -16,6 +22,8 @@ pub trait Cache<T: Value> {
     type Pointer: Deref<Target = T> + Clone;
 
     fn len(&self) -> usize;
+
+    fn iter(&self) -> impl Iterator<Item = Self::Pointer>;
 
     fn entry<'c, 'k, K>(
         &'c self,
@@ -164,13 +172,11 @@ pub trait Value {
     fn key(&self) -> &Self::Key;
 }
 
-
-
 #[test]
 fn test() {
-    use build::{BuildCacheExt as _, BuildCache as _};
-    use evict::touch::EvictLeastRecentlyTouched;
-    use std::time::{Duration, Instant};
+    use build::{BuildCache as _, BuildCacheExt as _};
+    use std::{time::{Duration, Instant}, future::Future};
+    use load::{AsyncLoad, AsyncLoadCache};
 
     struct Test {
         key: String,
@@ -178,7 +184,7 @@ fn test() {
     }
 
     impl Value for Test {
-        type Key = str;
+        type Key = String;
 
         fn key(&self) -> &Self::Key {
             &self.key
@@ -191,13 +197,40 @@ fn test() {
         }
     }
 
+    struct TestSource;
+
+    impl AsyncLoad<Test> for TestSource {
+        type Output = Test;
+
+        fn load<K>(&self, key: &K) -> impl Future<Output = Self::Output> + Send
+        where
+            K: ?Sized + ToOwned<Owned = String>,
+        {
+            let key = key.to_owned();
+            async move {
+                Test {
+                    key,
+                    expire: Instant::now(),
+                }
+            }
+        }
+    }
+
     let cache = sync::SyncCacheBuilder::new()
-        .evict(
-            evict::EvictApproximate::with_window(evict::touch::EvictLeastRecentlyTouched, Duration::from_secs(1)))
+        .evict(evict::EvictApproximate::with_window(
+            evict::touch::EvictLeastRecentlyTouched,
+            Duration::from_secs(1),
+        ))
         .expire_at()
-        .build();
-    // .expire_intrusive();
-    // .layer(expire::ExpireIntrusive);
-    // .expire_intrusive();
-    cache.insert(Test { key: "abc".into(), expire: Instant::now() });
+        .build_load_dedup(TestSource);
+
+    async fn use_cache(cache: &impl AsyncLoadCache<Test>) {
+        cache.insert(Test {
+            key: "abc".into(),
+            expire: Instant::now(),
+        });
+
+        let entry = cache.load("abc").await;
+    }
+    let _ = use_cache(&cache);
 }

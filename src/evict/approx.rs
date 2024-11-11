@@ -1,11 +1,11 @@
-use std::{marker::PhantomData, sync::atomic::Ordering, time::Duration};
+use std::{sync::atomic::Ordering, time::Duration};
 
 use crate::{
     lock::UpgradeReadGuard,
     time::{AtomicInstant, Clock, DefaultClock},
 };
 
-use super::{Evict, TouchLock};
+use super::{Evict, TouchLockHint};
 
 pub struct EvictApproximate<E, C = DefaultClock> {
     inner: E,
@@ -23,8 +23,6 @@ impl<E> EvictApproximate<E> {
     }
 }
 
-struct PointInner<Pt>(PhantomData<Pt>);
-
 impl<E, C, P> Evict<P> for EvictApproximate<E, C>
 where
     E: Evict<P>,
@@ -33,7 +31,7 @@ where
     type Value = (AtomicInstant, E::Value);
     type Queue = E::Queue;
 
-    const TOUCH_LOCK: TouchLock = TouchLock::MayWrite;
+    const TOUCH_LOCK_HINT: TouchLockHint = TouchLockHint::MayWrite;
 
     fn new_queue(&mut self, capacity: usize) -> Self::Queue {
         self.inner.new_queue(capacity)
@@ -66,16 +64,5 @@ where
 
     fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
         self.inner.remove(queue, pointer, move |p| &deref(p).1);
-    }
-
-    fn replace(
-        &self,
-        queue: &mut Self::Queue,
-        pointer: &P,
-        construct: impl FnOnce(Self::Value) -> P,
-        deref: impl Fn(&P) -> &Self::Value,
-    ) -> (P, impl Iterator<Item = P>) {
-        self.inner
-            .replace(queue, pointer, |k| construct((self.clock.now().into(), k)), move |p| &deref(p).1)
     }
 }

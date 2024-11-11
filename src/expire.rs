@@ -31,6 +31,10 @@ where
         self.0.len()
     }
 
+    fn iter(&self) -> impl Iterator<Item = Self::Pointer> {
+        self.0.iter().filter(|p| !p.is_expired())
+    }
+
     fn entry<'c, 'k, K>(
         &'c self,
         key: &'k K,
@@ -133,6 +137,10 @@ where
 
     fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Self::Pointer> {
+        self.inner.iter().filter(|p| p.expire_at() >= self.clock.now())
     }
 
     fn entry<'c, 'k, K>(

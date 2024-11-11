@@ -1,12 +1,28 @@
 use std::marker::PhantomData;
 
-use crate::expire;
+use crate::{load::DedupLoadIntrusive, expire, Cache, Value};
 
 
 pub trait BuildCache<T> {
     type Cache;
 
     fn build(self) -> Self::Cache;
+
+    fn build_load_dedup<L>(self, load: L) -> DedupLoadIntrusive<L, Self::Cache> 
+    where 
+        Self: Sized
+    {
+        DedupLoadIntrusive::new(load, self.build())
+    }
+
+    fn assert_will_build(self) -> Self
+    where 
+        Self: Sized,
+        Self::Cache: Cache<T>,
+        T: Value,
+    {
+        self
+    }
 }
 
 pub trait Layer<C> {

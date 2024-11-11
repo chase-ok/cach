@@ -1,6 +1,6 @@
 use super::index::Key;
 use super::list::List;
-use super::{Evict, TouchLock, UpgradeReadGuard};
+use super::{Evict, TouchLockHint, UpgradeReadGuard};
 
 #[derive(Debug)]
 pub struct EvictLeastRecentlyTouched;
@@ -9,7 +9,7 @@ impl<P: Clone> Evict<P> for EvictLeastRecentlyTouched {
     type Value = Key;
     type Queue = List<P>;
 
-    const TOUCH_LOCK: TouchLock = TouchLock::RequireWrite;
+    const TOUCH_LOCK_HINT: TouchLockHint = TouchLockHint::RequireWrite;
 
     fn new_queue(&mut self, capacity: usize) -> Self::Queue {
         List::with_capacity(capacity)
@@ -37,18 +37,5 @@ impl<P: Clone> Evict<P> for EvictLeastRecentlyTouched {
     fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
         let removed = queue.remove(*deref(pointer));
         debug_assert!(removed.is_some());
-    }
-
-    fn replace(
-        &self,
-        queue: &mut Self::Queue,
-        pointer: &P,
-        construct: impl FnOnce(Self::Value) -> P,
-        deref: impl Fn(&P) -> &Self::Value,
-    ) -> (P, impl Iterator<Item = P>) {
-        let removed = queue.remove(*deref(pointer));
-        debug_assert!(removed.is_some());
-        let value = queue.push_tail_with_key(construct);
-        (value.clone(), std::iter::empty())
     }
 }

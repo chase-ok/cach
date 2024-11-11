@@ -47,6 +47,10 @@ where
         self.cache.len()
     }
 
+    fn iter(&self) -> impl Iterator<Item = Self::Pointer> {
+        self.cache.iter().map(WrappedPointer)
+    }
+
     fn entry<'c, 'k, K>(
         &'c self,
         key: &'k K,

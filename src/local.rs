@@ -82,8 +82,12 @@ impl<T, E> Deref for Pointer<T, E> {
 }
 
 // XX: just a wrapper around Rc<> that does impl Stable/Clone
-unsafe impl<T, E> StableDeref for Pointer<T, E> { }
-unsafe impl<T, E> CloneStableDeref for Pointer<T, E> { }
+unsafe impl<T, E> StableDeref for Pointer<T, E> {}
+unsafe impl<T, E> CloneStableDeref for Pointer<T, E> {}
+
+fn deref_eviction<T, E>(pointer: &Pointer<T, E>) -> &E {
+    &pointer.0.eviction
+}
 
 impl<T, E, Ev, Eq, S> crate::Cache<T> for LocalCache<T, E, Ev, Eq, S>
 where
@@ -96,6 +100,13 @@ where
 
     fn len(&self) -> usize {
         self.table.borrow().len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Self::Pointer> {
+        let pointers: Vec<_> = unsafe {
+            self.table.borrow().iter().map(|b| b.as_ref().clone()).collect()
+        };
+        pointers.into_iter()
     }
 
     fn entry<'c, 'k, K>(
@@ -151,10 +162,11 @@ where
         if let Some(inner) = self.0.take() {
             // XX Safety
             let pointer = unsafe { inner.bucket.as_ref() };
-            inner
-                .cache
-                .eviction
-                .touch(&mut *inner.cache.queue.borrow_mut(), &pointer, |p| &p.0.eviction);
+            inner.cache.eviction.touch(
+                &mut *inner.cache.queue.borrow_mut(),
+                &pointer,
+                deref_eviction,
+            );
         }
     }
 }
@@ -192,16 +204,20 @@ where
 
         let (replace, evict) = {
             let mut queue = inner.cache.queue.borrow_mut();
-            let (replace, evict) =
-                inner
-                    .cache
-                    .eviction
-                    .replace(&mut queue, &pointer, |eviction| {
-                        Pointer(Rc::new(Value {
-                            inner: value,
-                            eviction,
-                        }))
-                    }, |p| &p.0.eviction);
+            inner
+                .cache
+                .eviction
+                .remove(&mut queue, &pointer, deref_eviction);
+            let (replace, evict) = inner.cache.eviction.insert(
+                &mut queue,
+                |eviction| {
+                    Pointer(Rc::new(Value {
+                        inner: value,
+                        eviction,
+                    }))
+                },
+                deref_eviction,
+            );
             let evict = evict.collect::<SmallVec<[_; 8]>>();
             (replace, evict)
         };
@@ -225,10 +241,11 @@ where
 
         // XX Safety
         let (removed, _slot) = unsafe { inner.cache.table.borrow_mut().remove(inner.bucket) };
-        inner
-            .cache
-            .eviction
-            .remove(&mut inner.cache.queue.borrow_mut(), &removed, |p| &p.0.eviction);
+        inner.cache.eviction.remove(
+            &mut inner.cache.queue.borrow_mut(),
+            &removed,
+            deref_eviction,
+        );
         removed
     }
 }
@@ -252,15 +269,16 @@ where
 
         let (insert, evict) = {
             let mut queue = self.cache.queue.borrow_mut();
-            let (insert, evict) =
-                self.cache
-                    .eviction
-                    .insert(&mut queue, |eviction| {
-                        Pointer(Rc::new(Value {
-                            inner: value,
-                            eviction,
-                        }))
-                    }, |p| &p.0.eviction);
+            let (insert, evict) = self.cache.eviction.insert(
+                &mut queue,
+                |eviction| {
+                    Pointer(Rc::new(Value {
+                        inner: value,
+                        eviction,
+                    }))
+                },
+                deref_eviction,
+            );
             let evict = evict.collect::<SmallVec<[_; 8]>>();
             (insert, evict)
         };

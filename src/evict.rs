@@ -4,6 +4,7 @@ mod approx;
 pub mod generation;
 pub mod touch;
 pub mod write;
+// pub mod multi;
 
 #[cfg(feature = "rand")]
 pub mod random;
@@ -20,7 +21,7 @@ pub trait Evict<P> {
     type Value;
     type Queue;
 
-    const TOUCH_LOCK: TouchLock;
+    const TOUCH_LOCK_HINT: TouchLockHint;
 
     fn new_queue(&mut self, capacity: usize) -> Self::Queue;
 
@@ -41,19 +42,11 @@ pub trait Evict<P> {
     );
 
     fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value);
-
-    fn replace(
-        &self,
-        queue: &mut Self::Queue,
-        pointer: &P,
-        construct: impl FnOnce(Self::Value) -> P,
-        deref: impl Fn(&P) -> &Self::Value,
-    ) -> (P, impl Iterator<Item = P>);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TouchLock {
-    None,
+pub enum TouchLockHint {
+    NoLock,
     MayWrite,
     RequireWrite,
 }
@@ -65,7 +58,7 @@ impl<P> Evict<P> for EvictNone {
     type Value = ();
     type Queue = ();
 
-    const TOUCH_LOCK: TouchLock = TouchLock::None;
+    const TOUCH_LOCK_HINT: TouchLockHint = TouchLockHint::NoLock;
 
     fn new_queue(&mut self, _capacity: usize) -> Self::Queue {
         ()
@@ -89,16 +82,6 @@ impl<P> Evict<P> for EvictNone {
     }
 
     fn remove(&self, _queue: &mut Self::Queue, _pointer: &P, _deref: impl Fn(&P) -> &Self::Value) {}
-
-    fn replace(
-        &self,
-        _queue: &mut Self::Queue,
-        _pointer: &P,
-        construct: impl FnOnce(Self::Value) -> P,
-        _deref: impl Fn(&P) -> &Self::Value,
-    ) -> (P, impl Iterator<Item = P>) {
-        (construct(()), std::iter::empty())
-    }
 }
 
 // pub struct EvictOr<E1, E2>(E1, E2);

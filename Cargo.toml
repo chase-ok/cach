@@ -11,6 +11,9 @@ scc = "2.2.1"
 smallvec = { version = "1.13.2", features = ["union", "const_generics"] }
 rand = { version = "0.8.5", features = ["small_rng", "std_rng"], optional = true }
 stable_deref_trait = "1.2.0"
+trait-variant = "0.1.2"
+futures = "0.3.31"
+slab = "0.4.9"
 
 [features]
 default = ["rand"]

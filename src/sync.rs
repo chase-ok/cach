@@ -1,10 +1,5 @@
 use std::{
-    borrow::Borrow,
-    hash::{BuildHasher, Hash},
-    marker::PhantomData,
-    ops::Deref,
-    sync::Arc,
-    usize,
+    borrow::Borrow, hash::{BuildHasher, Hash}, marker::PhantomData, ops::Deref, sync::Arc, usize
 };
 
 use crossbeam_utils::CachePadded;
@@ -18,7 +13,7 @@ use stable_deref_trait::{CloneStableDeref, StableDeref};
 
 use crate::{
     build::BuildCache,
-    evict::{Evict, EvictNone, TouchLock},
+    evict::{Evict, EvictNone, TouchLockHint},
     lock::MapUpgradeReadGuard,
     Cache,
 };
@@ -124,6 +119,7 @@ where
             hash_builder: self.hash_builder,
             mask: self.shards - 1,
             eviction: self.eviction,
+            capacity_per_shard,
         }
     }
 }
@@ -139,6 +135,7 @@ pub struct SyncCache<T, E, Ev, Eq, S> {
     shards: Vec<CachePadded<RwLock<Shard<T, Ev, Eq>>>>,
     hash_builder: S,
     mask: usize,
+    capacity_per_shard: usize,
     eviction: E,
 }
 
@@ -172,6 +169,10 @@ impl<T, E> Deref for Pointer<T, E> {
 unsafe impl<T, E> StableDeref for Pointer<T, E> {}
 unsafe impl<T, E> CloneStableDeref for Pointer<T, E> {}
 
+fn deref_eviction<T, E>(pointer: &Pointer<T, E>) -> &E {
+    &pointer.0.eviction
+}
+
 impl<T, E, Ev, Eq, S> Cache<T> for SyncCache<T, E, Ev, Eq, S>
 where
     T: crate::Value + 'static,
@@ -188,14 +189,54 @@ where
             .sum()
     }
 
+    fn iter(&self) -> impl Iterator<Item = Self::Pointer> {
+        struct Iter<I, T, Ev, Eq> {
+            iter: I,
+            pointers: Vec<Pointer<T, Ev>>,
+            _marker: PhantomData<Eq>
+        }
+
+        impl<'a, I, T: 'a, Ev: 'a, Eq: 'a> Iterator for Iter<I, T, Ev, Eq> 
+        where 
+            I: Iterator<Item = &'a CachePadded<RwLock<Shard<T, Ev, Eq>>>>
+        {
+            type Item = Pointer<T, Ev>;
+        
+            fn next(&mut self) -> Option<Self::Item> {
+                loop {
+                    if let Some(pointer) = self.pointers.pop() {
+                        return Some(pointer);
+                    } else if let Some(shard) = self.iter.next() {
+                        // XX safety
+                        self.pointers.extend(unsafe { 
+                            shard.read()
+                                .values
+                                .iter()
+                                .map(|b| b.as_ref().clone())
+                                
+                        });
+                    } else {
+                        return None
+                    }
+                }
+            }
+        }
+
+        Iter {
+            iter: self.shards.iter(),
+            pointers: Vec::with_capacity(self.capacity_per_shard),
+            _marker: PhantomData,
+        }
+    }
+
     fn get<K>(&self, key: &K) -> Option<Self::Pointer>
     where
         T::Key: Borrow<K>,
         K: ?Sized + Hash + std::cmp::Eq,
     {
         let (hash, shard) = self.hash_and_shard(key);
-        let pointer = match E::TOUCH_LOCK {
-            TouchLock::None | TouchLock::MayWrite => {
+        let pointer = match E::TOUCH_LOCK_HINT {
+            TouchLockHint::NoLock | TouchLockHint::MayWrite => {
                 let shard = self.shards[shard].read();
                 let pointer = shard
                     .values
@@ -205,19 +246,19 @@ where
                 let touch_guard =
                     MapUpgradeReadGuard::new(shard, |s| &s.eviction, |s| &mut s.eviction);
                 self.eviction
-                    .touch(touch_guard, &pointer, |p| &p.0.eviction);
+                    .touch(touch_guard, &pointer, deref_eviction);
 
                 pointer
             }
 
-            TouchLock::RequireWrite => {
+            TouchLockHint::RequireWrite => {
                 let mut shard = self.shards[shard].write();
                 let pointer = shard
                     .values
                     .get(hash, |p| p.0.value.key().borrow() == key)?
                     .clone();
                 self.eviction
-                    .touch(&mut shard.eviction, &pointer, |p| &p.0.eviction);
+                    .touch(&mut shard.eviction, &pointer, deref_eviction);
                 pointer
             }
         };
@@ -264,6 +305,7 @@ impl<T, E, Ev, Eq, S: BuildHasher> SyncCache<T, E, Ev, Eq, S> {
     fn hash_and_shard(&self, key: &(impl Hash + ?Sized)) -> (u64, usize) {
         let hash = self.hash_builder.hash_one(key);
         // XX is the double hash actually helping?
+        // XX: replace with XOR, not hash
         let shard = (self.hash_builder.hash_one(hash) as usize) & self.mask;
         (hash, shard)
     }
@@ -296,7 +338,7 @@ where
             inner
                 .cache
                 .eviction
-                .touch(touch_guard, &pointer, |p| &p.0.eviction);
+                .touch(touch_guard, &pointer, deref_eviction);
         }
     }
 }
@@ -332,16 +374,15 @@ where
 
         debug_assert!(value.key() == pointer.key());
 
-        let (replace, evict) = {
-            let (replace, evict) = this.cache.eviction.replace(
-                &mut this.shard.eviction,
-                &pointer,
-                |eviction| Pointer(Arc::new(Value { value, eviction })),
-                |p| &p.0.eviction,
-            );
-            let evict = evict.collect::<SmallVec<[_; 8]>>();
-            (replace, evict)
-        };
+        this.cache
+            .eviction
+            .remove(&mut this.shard.eviction, &pointer, deref_eviction);
+        let (replace, evict) = this.cache.eviction.insert(
+            &mut this.shard.eviction,
+            |eviction| Pointer(Arc::new(Value { value, eviction })),
+            deref_eviction,
+        );
+        let evict = evict.collect::<SmallVec<[_; 8]>>();
         *pointer = replace.clone();
 
         for evicted in evict {
@@ -363,7 +404,7 @@ where
         inner
             .cache
             .eviction
-            .remove(&mut inner.shard.eviction, &removed, |p| &p.0.eviction);
+            .remove(&mut inner.shard.eviction, &removed, deref_eviction);
         removed
     }
 }
@@ -390,7 +431,7 @@ where
             let (insert, evict) = self.cache.eviction.insert(
                 &mut self.shard.eviction,
                 |eviction| Pointer(Arc::new(Value { value, eviction })),
-                |p| &p.0.eviction,
+                deref_eviction,
             );
             let evict = evict.collect::<SmallVec<[_; 8]>>();
             (insert, evict)
