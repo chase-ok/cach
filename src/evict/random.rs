@@ -3,11 +3,10 @@ use std::marker::PhantomData;
 use rand::{thread_rng, Rng, SeedableRng};
 use stable_deref_trait::CloneStableDeref;
 
-use crate::lock::UpgradeReadGuard;
+use crate::{layer::{self, Layer}, lock::UpgradeReadGuard};
 
 use super::{
     bag::{Bag, Key},
-    Evict, TouchLockHint,
 };
 
 pub struct EvictRandom<R = rand::rngs::SmallRng>(PhantomData<R>);
@@ -19,51 +18,40 @@ impl<R> Default for EvictRandom<R> {
 }
 
 #[doc(hidden)]
-pub struct Queue<P, R> {
+pub struct Shard<P, R> {
     bag: Bag<P>,
     rng: R,
 }
 
 // XX requires clone stable for atomics
-impl<P: CloneStableDeref, R: Rng + SeedableRng> Evict<P> for EvictRandom<R> {
+impl<P: CloneStableDeref, R: Rng + SeedableRng> Layer<P> for EvictRandom<R> {
     type Value = Key;
-    type Queue = Queue<P, R>;
+    type Shard = Shard<P, R>;
 
-    const TOUCH_LOCK_HINT: TouchLockHint = TouchLockHint::NoLock;
-
-    fn new_queue(&mut self, capacity: usize) -> Self::Queue {
+    fn new_shard(&self, capacity: usize) -> Self::Shard {
         assert!(capacity > 0);
-        Queue {
+        Shard {
             bag: Bag::with_capacity(capacity),
             rng: R::from_rng(thread_rng()).unwrap(),
         }
     }
+}
 
-    fn insert(
-        &self,
-        queue: &mut Self::Queue,
-        construct: impl FnOnce(Self::Value) -> P,
-        deref: impl Fn(&P) -> &Self::Value,
-    ) -> (P, impl Iterator<Item = P>) {
-        let removed = if queue.bag.len() == queue.bag.capacity() {
-            queue.bag.pop(|len| queue.rng.gen_range(0..len), deref)
-        } else {
-            None
-        };
+impl<P: CloneStableDeref, G: Rng + SeedableRng> layer::Shard<P> for Shard<P, G> {
+    type Value = Key;
 
-        let value = queue.bag.insert_with_key(construct);
-        (value.clone(), removed.into_iter())
+    fn write<R: layer::Resolve<P, Self::Value>>(&mut self, mut write: impl layer::Write<P, Self::Value>) -> P {
+        if self.bag.len() == self.bag.capacity() {
+            if let Some(removed) = self.bag.pop(|len| self.rng.gen_range(0..len), R::resolve) {
+                write.remove(&removed);
+            }
+        }
+        self.bag.insert_with_key(move |key| write.insert(key)).clone()
+    }
+    
+    fn remove<R: layer::Resolve<P, Self::Value>>(&mut self, pointer: &P) {
+        self.bag.remove(pointer, R::resolve);
     }
 
-    fn touch(
-        &self,
-        _queue: impl UpgradeReadGuard<Target = Self::Queue>,
-        _pointer: &P,
-        _deref: impl Fn(&P) -> &Self::Value,
-    ) {
-    }
-
-    fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
-        queue.bag.remove(pointer, deref);
-    }
+    const READ_LOCK_BEHAVIOR: layer::ReadLockBehavior = layer::ReadLockBehavior::ReadLockOnly;
 }

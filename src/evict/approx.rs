@@ -1,11 +1,8 @@
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{ops::Deref, sync::atomic::Ordering, time::Duration};
 
 use crate::{
-    lock::UpgradeReadGuard,
-    time::{AtomicInstant, Clock, DefaultClock},
+    layer::Layer, lock::UpgradeReadGuard, time::{AtomicInstant, Clock, DefaultClock}
 };
-
-use super::{Evict, TouchLockHint};
 
 pub struct EvictApproximate<E, C = DefaultClock> {
     inner: E,
@@ -23,46 +20,47 @@ impl<E> EvictApproximate<E> {
     }
 }
 
-impl<E, C, P> Evict<P> for EvictApproximate<E, C>
-where
-    E: Evict<P>,
-    C: Clock,
-{
-    type Value = (AtomicInstant, E::Value);
-    type Queue = E::Queue;
+// impl<E, C, P> Layer<P> for EvictApproximate<E, C>
+// where
+//     P: Deref,
+//     E: Layer<P>, // XX: need special eviction trait?
+//     C: Clock,
+// {
+//     type Value = (AtomicInstant, E::Value);
+//     type Shard = ApproximateShard()
 
-    const TOUCH_LOCK_HINT: TouchLockHint = TouchLockHint::MayWrite;
+//     const TOUCH_LOCK_HINT: TouchLockHint = TouchLockHint::MayWrite;
 
-    fn new_queue(&mut self, capacity: usize) -> Self::Queue {
-        self.inner.new_queue(capacity)
-    }
+//     fn new_queue(&mut self, capacity: usize) -> Self::Queue {
+//         self.inner.new_queue(capacity)
+//     }
 
-    fn insert(
-        &self,
-        queue: &mut Self::Queue,
-        construct: impl FnOnce(Self::Value) -> P,
-        deref: impl Fn(&P) -> &Self::Value,
-    ) -> (P, impl Iterator<Item = P>) {
-        self.inner
-            .insert(queue, |inner| construct((self.clock.now().into(), inner)), move |p| &deref(p).1)
-    }
+//     fn insert(
+//         &self,
+//         queue: &mut Self::Queue,
+//         construct: impl FnOnce(Self::Value) -> P,
+//         deref: impl Fn(&P) -> &Self::Value,
+//     ) -> (P, impl Iterator<Item = P>) {
+//         self.inner
+//             .insert(queue, |inner| construct((self.clock.now().into(), inner)), move |p| &deref(p).1)
+//     }
 
-    fn touch(&self, queue: impl UpgradeReadGuard<Target = Self::Queue>, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
-        let now = self.clock.now();
-        let value = deref(pointer);
-        let last = value.0.load(Ordering::Relaxed);
-        let since_touched = now.checked_duration_since(last).unwrap_or_default();
-        if since_touched >= self.window
-            && value
-                .0
-                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            self.inner.touch(queue, pointer, move |p| &deref(p).1)
-        }
-    }
+//     fn touch(&self, queue: impl UpgradeReadGuard<Target = Self::Queue>, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
+//         let now = self.clock.now();
+//         let value = deref(pointer);
+//         let last = value.0.load(Ordering::Relaxed);
+//         let since_touched = now.checked_duration_since(last).unwrap_or_default();
+//         if since_touched >= self.window
+//             && value
+//                 .0
+//                 .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+//                 .is_ok()
+//         {
+//             self.inner.touch(queue, pointer, move |p| &deref(p).1)
+//         }
+//     }
 
-    fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
-        self.inner.remove(queue, pointer, move |p| &deref(p).1);
-    }
-}
+//     fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
+//         self.inner.remove(queue, pointer, move |p| &deref(p).1);
+//     }
+// }

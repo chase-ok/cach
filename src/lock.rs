@@ -6,7 +6,18 @@ use parking_lot::{RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
 pub trait UpgradeReadGuard: Deref {
     type WriteGuard: Deref<Target = Self::Target> + DerefMut;
 
+    // XX: safety around read => write losing lock in between!
+    const ATOMIC_UPGRADE: bool;
+
     fn upgrade(self) -> Self::WriteGuard;
+
+    fn atomic_upgrade(self) -> Self::WriteGuard 
+    where 
+        Self: Sized 
+    {
+        assert!(Self::ATOMIC_UPGRADE);
+        self.upgrade()
+    }
 
     // XX: remove if not needed?
     fn try_upgrade(self) -> Option<Self::WriteGuard>
@@ -20,6 +31,8 @@ pub trait UpgradeReadGuard: Deref {
 impl<'a, T> UpgradeReadGuard for RwLockUpgradableReadGuard<'a, T> {
     type WriteGuard = RwLockWriteGuard<'a, T>;
 
+    const ATOMIC_UPGRADE: bool = true;
+
     fn upgrade(self) -> Self::WriteGuard {
         RwLockUpgradableReadGuard::upgrade(self)
     }
@@ -31,6 +44,8 @@ impl<'a, T> UpgradeReadGuard for RwLockUpgradableReadGuard<'a, T> {
 
 impl<'a, T> UpgradeReadGuard for RwLockReadGuard<'a, T> {
     type WriteGuard = RwLockWriteGuard<'a, T>;
+
+    const ATOMIC_UPGRADE: bool = false;
 
     fn upgrade(self) -> Self::WriteGuard {
         let lock = RwLockReadGuard::rwlock(&self);
@@ -47,6 +62,8 @@ impl<'a, T> UpgradeReadGuard for RwLockReadGuard<'a, T> {
 
 impl<T> UpgradeReadGuard for RwLockWriteGuard<'_, T> {
     type WriteGuard = Self;
+
+    const ATOMIC_UPGRADE: bool = true;
 
     fn upgrade(self) -> Self {
         self
@@ -119,6 +136,8 @@ where
 {
     type WriteGuard = MapUpgradeReadGuard<G::WriteGuard, T, D, DM>;
 
+    const ATOMIC_UPGRADE: bool = G::ATOMIC_UPGRADE;
+
     fn upgrade(self) -> Self::WriteGuard {
         MapUpgradeReadGuard {
             guard: self.guard.upgrade(),
@@ -131,6 +150,8 @@ where
 
 impl<T> UpgradeReadGuard for &mut T {
     type WriteGuard = Self;
+
+    const ATOMIC_UPGRADE: bool = true;
 
     fn upgrade(self) -> Self::WriteGuard {
         self
@@ -150,8 +171,20 @@ impl<G: UpgradeReadGuard> UpgradeReadGuardCell<G> {
         Self(UpgradeReadGuardCellState::Read(guard))
     }
 
-    pub fn borrow(&mut self) -> UpgradeReadGuardCellRef<'_, G> {
+    pub fn guard(&mut self) -> UpgradeReadGuardCellRef<'_, G> {
         UpgradeReadGuardCellRef(&mut self.0)
+    }
+}
+
+impl<G: UpgradeReadGuard> Deref for UpgradeReadGuardCell<G> {
+    type Target = G::Target;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            UpgradeReadGuardCellState::None => unreachable!(),
+            UpgradeReadGuardCellState::Read(r) => r,
+            UpgradeReadGuardCellState::Write(w) => w,
+        }
     }
 }
 
@@ -192,6 +225,8 @@ impl<G: UpgradeReadGuard> DerefMut for UpgradeReadGuardCellRefMut<'_, G> {
 
 impl<'a, G: UpgradeReadGuard> UpgradeReadGuard for UpgradeReadGuardCellRef<'a, G> {
     type WriteGuard = UpgradeReadGuardCellRefMut<'a, G>;
+
+    const ATOMIC_UPGRADE: bool = G::ATOMIC_UPGRADE;
 
     fn upgrade(self) -> Self::WriteGuard {
         let UpgradeReadGuardCellState::Read(guard) = std::mem::replace(self.0, UpgradeReadGuardCellState::None) else {

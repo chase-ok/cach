@@ -1,91 +1,41 @@
 use std::ops::Deref;
-use std::time::Instant;
 
-use crate::expire::ExpireAt;
-use crate::time::{Clock, DefaultClock};
+use crate::layer;
 
 use super::index::Key;
 use super::list::List;
-use super::{Evict, TouchLockHint, UpgradeReadGuard};
 
 #[derive(Debug)]
 pub struct EvictLeastRecentlyInserted;
 
-impl<P: Clone> Evict<P> for EvictLeastRecentlyInserted {
+pub struct Shard<P>(List<P>);
+
+impl<P: Clone + Deref> layer::Layer<P> for EvictLeastRecentlyInserted {
     type Value = Key;
-    type Queue = List<P>;
+    type Shard = Shard<P>;
 
-    const TOUCH_LOCK_HINT: TouchLockHint = TouchLockHint::NoLock;
-
-    fn new_queue(&mut self, capacity: usize) -> Self::Queue {
-        List::with_capacity(capacity)
-    }
-
-    fn insert(
-        &self,
-        queue: &mut Self::Queue,
-        construct: impl FnOnce(Self::Value) -> P,
-        _deref: impl Fn(&P) -> &Self::Value,
-    ) -> (P, impl Iterator<Item = P>) {
-        let (value, removed) = queue.push_tail_with_key_and_pop_if_full(construct);
-        (value.clone(), removed.into_iter())
-    }
-
-    fn touch(&self, _queue: impl UpgradeReadGuard<Target = Self::Queue>, _pointer: &P, _deref: impl Fn(&P) -> &Self::Value) {}
-
-    fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
-        queue.remove(*deref(pointer)).unwrap();
+    fn new_shard(&self, capacity: usize) -> Self::Shard {
+        Shard(List::with_capacity(capacity))
     }
 }
 
-#[derive(Debug, Default)]
-pub struct EvictExpiredLeastRecentlyInserted<Clk = DefaultClock>(Clk);
-
-impl<P> Evict<P> for EvictExpiredLeastRecentlyInserted
-where
-    P: Clone + Deref,
-    P::Target: ExpireAt,
-{
+impl<P: Clone + Deref> layer::Shard<P> for Shard<P> {
     type Value = Key;
-    type Queue = List<P>;
 
-    const TOUCH_LOCK_HINT: TouchLockHint = TouchLockHint::NoLock;
+    fn write<R: layer::Resolve<P, Self::Value>>(&mut self, mut write: impl layer::Write<P, Self::Value>) -> P {
+        if self.0.len() == self.0.capacity() {
+            if let Some(removed) = self.0.pop_head() {
+                write.remove(&removed);
+            }
+        }
 
-    fn new_queue(&mut self, capacity: usize) -> Self::Queue {
-        List::with_capacity(capacity)
+        self.0.push_tail_with_key(|key| write.insert(key)).clone()
     }
 
-    fn insert(
-        &self,
-        queue: &mut Self::Queue,
-        construct: impl FnOnce(Self::Value) -> P,
-        _deref: impl Fn(&P) -> &Self::Value,
-    ) -> (P, impl Iterator<Item = P>) {
-        let value = queue.push_tail_with_key(construct);
-        (value.clone(), drain_expired(queue, self.0.now()))
-    }
+    const READ_LOCK_BEHAVIOR: layer::ReadLockBehavior = layer::ReadLockBehavior::ReadLockOnly;
 
-    fn touch(
-        &self,
-        _queue: impl UpgradeReadGuard<Target = Self::Queue>,
-        _pointer: &P,
-        _deref: impl Fn(&P) -> &Self::Value,
-    ) {
+    fn remove<R: layer::Resolve<P, Self::Value>>(&mut self, pointer: &P) {
+        let _ = self.0.remove(*R::resolve(pointer));
+        // XX debug assert?
     }
-
-    fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
-        let removed = queue.remove(*deref(pointer));
-        debug_assert!(removed.is_some());
-    }
-}
-
-fn drain_expired<P>(queue: &mut List<P>, now: Instant) -> impl Iterator<Item = P> + '_
-where
-    P: Clone + Deref,
-    P::Target: ExpireAt,
-{
-    queue
-        .drain()
-        .take_while(move |p| p.expire_at() <= now)
-        .take(8)
 }

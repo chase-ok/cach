@@ -174,7 +174,7 @@ pub trait Value {
 
 #[test]
 fn test() {
-    use build::{BuildCache as _, BuildCacheExt as _};
+    use build::{BuildCache};
     use std::{time::{Duration, Instant}, future::Future};
     use load::{AsyncLoad, AsyncLoadCache};
 
@@ -216,21 +216,25 @@ fn test() {
         }
     }
 
-    let cache = sync::SyncCacheBuilder::new()
-        .evict(evict::EvictApproximate::with_window(
-            evict::touch::EvictLeastRecentlyTouched,
-            Duration::from_secs(1),
-        ))
+    let cache = BuildCache::<Test>::default()
         .expire_at()
-        .build_load_dedup(TestSource);
+        .build_sync();
 
-    async fn use_cache(cache: &impl AsyncLoadCache<Test>) {
-        cache.insert(Test {
-            key: "abc".into(),
-            expire: Instant::now(),
-        });
+    // let cache = sync::SyncCacheBuilder::new()
+    //     .evict(evict::EvictApproximate::with_window(
+    //         evict::touch::EvictLeastRecentlyTouched,
+    //         Duration::from_secs(1),
+    //     ))
+    //     .expire_at()
+    //     .build_load_dedup(TestSource);
 
-        let entry = cache.load("abc").await;
-    }
-    let _ = use_cache(&cache);
+    // async fn use_cache(cache: &impl AsyncLoadCache<Test>) {
+    //     cache.insert(Test {
+    //         key: "abc".into(),
+    //         expire: Instant::now(),
+    //     });
+
+    //     let entry = cache.load("abc").await;
+    // }
+    // let _ = use_cache(&cache);
 }

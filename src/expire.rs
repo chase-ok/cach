@@ -1,101 +1,61 @@
-use std::{borrow::Borrow, hash::Hash, ops::Deref, time::Instant};
+use std::{
+    ops::Deref,
+    sync::{atomic::Ordering, Arc},
+    time::Instant,
+};
 
 use crate::{
-    build::Layer, time::ExpiryTime, Cache, Clock, DefaultClock, OccupiedEntry, Value
+    layer::{Layer, ReadLockBehavior, ReadResult, Resolve, Shard, Write},
+    lock::UpgradeReadGuard,
+    time::AtomicInstant,
+    Clock, DefaultClock, 
 };
 
 pub trait Expire {
     fn is_expired(&self) -> bool;
 }
 
+#[derive(Debug)]
 pub struct ExpireLayer;
 
-impl<C> Layer<C> for ExpireLayer {
-    type Cache = ExpireCache<C>;
-
-    fn layer(self, inner: C) -> Self::Cache {
-        ExpireCache(inner)
-    }
-}
-
-pub struct ExpireCache<C>(C);
-
-impl<T, C> Cache<T> for ExpireCache<C>
+impl<P> Layer<P> for ExpireLayer
 where
-    T: Value + Expire,
-    C: Cache<T>,
+    P: Deref,
+    P::Target: Expire,
 {
-    type Pointer = C::Pointer;
+    type Value = ();
+    type Shard = ExpireLayer;
 
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    fn iter(&self) -> impl Iterator<Item = Self::Pointer> {
-        self.0.iter().filter(|p| !p.is_expired())
-    }
-
-    fn entry<'c, 'k, K>(
-        &'c self,
-        key: &'k K,
-    ) -> crate::Entry<
-        impl crate::OccupiedEntry<Pointer = Self::Pointer> + 'c,
-        impl crate::VacantEntry<Pointer = Self::Pointer> + 'c,
-    >
-    where
-        T::Key: Borrow<K>,
-        K: ?Sized + Hash + Eq,
-    {
-        match self.0.entry(key) {
-            crate::Entry::Occupied(occupied) => {
-                if occupied.value().is_expired() {
-                    crate::Entry::Occupied(occupied)
-                } else {
-                    crate::Entry::Vacant(Vacant(Some(VacantInner::Expired(occupied))))
-                }
-            }
-
-            crate::Entry::Vacant(vacant) => {
-                crate::Entry::Vacant(Vacant(Some(VacantInner::Vacant(vacant))))
-            }
-        }
+    fn new_shard(&self, _capacity: usize) -> Self::Shard {
+        ExpireLayer
     }
 }
 
-struct Vacant<O: crate::OccupiedEntry, V>(Option<VacantInner<O, V>>);
-
-enum VacantInner<O, V> {
-    Expired(O),
-    Vacant(V),
-}
-
-impl<O: crate::OccupiedEntry, V: crate::VacantEntry<Pointer = O::Pointer>> crate::VacantEntry
-    for Vacant<O, V>
+impl<P> Shard<P> for ExpireLayer
+where
+    P: Deref,
+    P::Target: Expire,
 {
-    type Pointer = O::Pointer;
+    type Value = ();
 
-    fn insert(mut self, value: <Self::Pointer as Deref>::Target) -> Self::Pointer
-    where
-        <Self::Pointer as Deref>::Target: Sized,
-    {
-        match self.0.take().unwrap() {
-            VacantInner::Expired(o) => o.replace(value),
-            VacantInner::Vacant(v) => v.insert(value),
+    fn write<R>(&mut self, write: impl Write<P, Self::Value>) -> P {
+        write.insert(())
+    }
+
+    const READ_LOCK_BEHAVIOR: ReadLockBehavior = ReadLockBehavior::ReadLockOnly;
+
+    fn read<'a, R: Resolve<P, Self::Value>>(
+        _this: impl UpgradeReadGuard<Target = Self>,
+        pointer: &P,
+    ) -> ReadResult {
+        if pointer.is_expired() {
+            ReadResult::Remove
+        } else {
+            ReadResult::Retain
         }
     }
-}
 
-impl<O: crate::OccupiedEntry, V> Drop for Vacant<O, V> {
-    fn drop(&mut self) {
-        if let Some(inner) = self.0.take() {
-            match inner {
-                VacantInner::Expired(o) => {
-                    o.remove();
-                }
-                _ => {}
-            }
-        }
-    }
+    fn remove<R>(&mut self, _pointer: &P) {}
 }
 
 pub trait ExpireAt {
@@ -103,160 +63,189 @@ pub trait ExpireAt {
 }
 
 #[derive(Debug, Default)]
-pub struct ExpireAtLayer<C = DefaultClock>(C);
+pub struct ExpireAtLayer<C = DefaultClock>(Arc<C>);
 
 impl<C> ExpireAtLayer<C> {
-    pub fn new(clock: C) -> Self {
-        Self(clock)
+    pub fn with_clock(clock: C) -> Self {
+        Self(Arc::new(clock))
     }
 }
 
-impl<C, Clk> Layer<C> for ExpireAtLayer<Clk> {
-    type Cache = ExpireAtCache<C, Clk>;
-
-    fn layer(self, inner: C) -> Self::Cache {
-        ExpireAtCache {
-            inner,
-            clock: self.0,
-        }
-    }
-}
-
-pub struct ExpireAtCache<C, Clk = DefaultClock> {
-    inner: C,
-    clock: Clk,
-}
-
-impl<T, C, Clk> Cache<T> for ExpireAtCache<C, Clk>
+impl<P, C> Layer<P> for ExpireAtLayer<C>
 where
-    T: Value + ExpireAt,
-    C: Cache<T>,
-    Clk: Clock,
+    P: Deref,
+    P::Target: ExpireAt,
+    C: Clock,
 {
-    type Pointer = C::Pointer;
+    type Value = ();
+    type Shard = ExpireAtLayer<C>;
 
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    fn iter(&self) -> impl Iterator<Item = Self::Pointer> {
-        self.inner.iter().filter(|p| p.expire_at() >= self.clock.now())
-    }
-
-    fn entry<'c, 'k, K>(
-        &'c self,
-        key: &'k K,
-    ) -> crate::Entry<
-        impl crate::OccupiedEntry<Pointer = Self::Pointer> + 'c,
-        impl crate::VacantEntry<Pointer = Self::Pointer> + 'c,
-    >
-    where
-        T::Key: Borrow<K>,
-        K: ?Sized + Hash + Eq,
-    {
-        match self.inner.entry(key) {
-            crate::Entry::Occupied(occupied) => {
-                if occupied.value().expire_at() >= self.clock.now() {
-                    crate::Entry::Occupied(occupied)
-                } else {
-                    crate::Entry::Vacant(Vacant(Some(VacantInner::Expired(occupied))))
-                }
-            }
-
-            crate::Entry::Vacant(vacant) => {
-                crate::Entry::Vacant(Vacant(Some(VacantInner::Vacant(vacant))))
-            }
-        }
+    fn new_shard(&self, _capacity: usize) -> Self::Shard {
+        Self(Arc::clone(&self.0))
     }
 }
 
-// #[derive(Debug, Default)]
-// pub struct ExpireAtIntrusive<C>(C);
+impl<P, C> Shard<P> for ExpireAtLayer<C>
+where
+    P: Deref,
+    P::Target: ExpireAt,
+    C: Clock,
+{
+    type Value = ();
 
-// impl<T, C> Layer<ExpiryTimeValue<T, C>> for ExpireAtIntrusive<C> 
-// where 
-//     T: Value + ExpiryTime,
-//     C: Clock + Clone,
-// {
-//     type Value = T;
+    fn write<R>(&mut self, write: impl Write<P, Self::Value>) -> P {
+        write.insert(())
+    }
 
-//     fn layer(self, inner: impl Cache<ExpiryTimeValue<T, C>>) -> impl Cache<T> {
-//         CacheWrapper::new(ExpireIntrusiveCache(inner), move |value| {
-//             ExpiryTimeValue {
-//                 value,
-//                 clock: self.0.clone(),
-//             }
-//         })
-//     }
-// }
+    const READ_LOCK_BEHAVIOR: ReadLockBehavior = ReadLockBehavior::ReadLockOnly;
 
-// impl<C: BuildCache<ExpiryTimeValue<T, Clk>>, T: Value + ExpiryTime, Clk> CacheLayer<C, T> for ExpireAtIntrusive<Clk> 
-// where 
-//     C: BuildCache<ExpiryTimeValue<T, Clk>>, 
-//     T: Value + ExpiryTime, 
-//     Clk: Clock + Clone,
-// {
-//     fn layer(self, inner: C) -> impl BuildCache<T> {
-//         struct Build<C, Clk>(C, Clk);
+    fn read<'a, R: Resolve<P, Self::Value>>(
+        this: impl UpgradeReadGuard<Target = Self>,
+        pointer: &P,
+    ) -> ReadResult {
+        if pointer.expire_at() <= this.0.now() {
+            ReadResult::Remove
+        } else {
+            ReadResult::Retain
+        }
+    }
 
-//         impl<C: BuildCache<ExpiryTimeValue<T, Clk>>, T: Value + ExpiryTime, Clk> BuildCache<T> for Build<C, Clk> 
-//         where
-//             C: BuildCache<ExpiryTimeValue<T, Clk>>, 
-//             T: Value + ExpiryTime, 
-//             Clk: Clock + Clone,
-//         {
-//             fn build(self) -> impl Cache<T> {
-//                 CacheWrapper::new(ExpireIntrusiveCache(self.0.build()), move |value| {
-//                     ExpiryTimeValue {
-//                         value,
-//                         clock: self.1.clone(),
-//                     }
-//                 })
-//             }
-//         }
+    fn remove<R>(&mut self, _pointer: &P) {}
+}
 
-//         Build(inner, self.0)
-//     }
-// }
+#[derive(Debug)]
+pub struct ExpireAfterWriteLayer<F, C = DefaultClock>(Arc<ExpireAfterWriteInner<F, C>>);
 
-// pub(crate) fn expire_at_intrusive<T, C>(cache: impl Cache<ExpiryTimeValue<T, C>>, clock: C) -> impl Cache<T> 
-// where 
-//     T: Value + ExpiryTime,
-//     C: Clock + Clone
-// {
-//     CacheWrapper::new(ExpireIntrusiveCache(cache), move |value| {
-//         ExpiryTimeValue {
-//             value,
-//             clock: clock.clone(),
-//         }
-//     })
-// }
-
-pub struct ExpiryTimeValue<T, C> {
-    value: T,
+#[derive(Debug)]
+struct ExpireAfterWriteInner<F, C> {
+    expire_at_fn: F,
     clock: C,
 }
 
-impl<T: Value, C> Value for ExpiryTimeValue<T, C> {
-    type Key = T::Key;
-
-    fn key(&self) -> &Self::Key {
-        self.value.key()
+impl<F, C: Default> ExpireAfterWriteLayer<F, C> {
+    pub fn new(expire_at_fn: F) -> Self {
+        Self::with_clock(expire_at_fn, C::default())
     }
 }
 
-impl<T: ExpiryTime, C: Clock> Expire for ExpiryTimeValue<T, C> {
-    fn is_expired(&self) -> bool {
-        self.value
-            .expiry_time()
-            .is_some_and(|t| t <= self.clock.now())
+impl<F, C> ExpireAfterWriteLayer<F, C> {
+    pub fn with_clock(expire_at_fn: F, clock: C) -> Self {
+        Self(Arc::new(ExpireAfterWriteInner {
+            expire_at_fn,
+            clock,
+        }))
     }
 }
 
-impl<T, C> Deref for ExpiryTimeValue<T, C> {
-    type Target = T;
+impl<P, F, C> Layer<P> for ExpireAfterWriteLayer<F, C>
+where
+    P: Deref,
+    F: Fn(Instant, &P::Target) -> Instant,
+    C: Clock,
+{
+    type Value = Instant;
+    type Shard = ExpireAfterWriteLayer<F, C>;
 
-    fn deref(&self) -> &Self::Target {
-        &self.value
+    fn new_shard(&self, _capacity: usize) -> Self::Shard {
+        Self(Arc::clone(&self.0))
     }
+}
+
+impl<P, F, C> Shard<P> for ExpireAfterWriteLayer<F, C>
+where
+    P: Deref,
+    F: Fn(Instant, &P::Target) -> Instant,
+    C: Clock,
+{
+    type Value = Instant;
+
+    fn write<R>(&mut self, write: impl Write<P, Self::Value>) -> P {
+        let expire = (self.0.expire_at_fn)(self.0.clock.now(), write.target());
+        write.insert(expire)
+    }
+
+    const READ_LOCK_BEHAVIOR: ReadLockBehavior = ReadLockBehavior::ReadLockOnly;
+
+    fn read<'a, R: Resolve<P, Self::Value>>(
+        this: impl UpgradeReadGuard<Target = Self>,
+        pointer: &P,
+    ) -> ReadResult {
+        if *R::resolve(pointer) <= this.0.clock.now() {
+            ReadResult::Remove
+        } else {
+            ReadResult::Retain
+        }
+    }
+
+    fn remove<R>(&mut self, _pointer: &P) {}
+}
+
+#[derive(Debug)]
+pub struct ExpireAfterReadLayer<F, C = DefaultClock>(Arc<ExpireAfterReadInner<F, C>>);
+
+#[derive(Debug)]
+struct ExpireAfterReadInner<F, C> {
+    expire_at_fn: F,
+    clock: C,
+}
+
+impl<F, C: Default> ExpireAfterReadLayer<F, C> {
+    pub fn new(expire_at_fn: F) -> Self {
+        Self::with_clock(expire_at_fn, C::default())
+    }
+}
+
+impl<F, C> ExpireAfterReadLayer<F, C> {
+    pub fn with_clock(expire_at_fn: F, clock: C) -> Self {
+        Self(Arc::new(ExpireAfterReadInner {
+            expire_at_fn,
+            clock,
+        }))
+    }
+}
+
+impl<P, F, C> Layer<P> for ExpireAfterReadLayer<F, C>
+where
+    P: Deref,
+    F: Fn(Instant, &P::Target) -> Instant,
+    C: Clock,
+{
+    type Value = AtomicInstant;
+    type Shard = ExpireAfterReadLayer<F, C>;
+
+    fn new_shard(&self, _capacity: usize) -> Self::Shard {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<P, F, C> Shard<P> for ExpireAfterReadLayer<F, C>
+where
+    P: Deref,
+    F: Fn(Instant, &P::Target) -> Instant,
+    C: Clock,
+{
+    type Value = AtomicInstant;
+
+    fn write<R>(&mut self, write: impl Write<P, Self::Value>) -> P {
+        let expire = (self.0.expire_at_fn)(self.0.clock.now(), write.target());
+        write.insert(expire.into())
+    }
+
+    const READ_LOCK_BEHAVIOR: ReadLockBehavior = ReadLockBehavior::ReadLockOnly;
+
+    fn read<'a, R: Resolve<P, Self::Value>>(
+        this: impl UpgradeReadGuard<Target = Self>,
+        pointer: &P,
+    ) -> ReadResult {
+        let now = this.0.clock.now();
+        let expire =
+            R::resolve(pointer).swap((this.0.expire_at_fn)(now, &pointer), Ordering::Relaxed);
+        if expire <= this.0.clock.now() {
+            ReadResult::Remove
+        } else {
+            ReadResult::Retain
+        }
+    }
+
+    fn remove<R>(&mut self, _pointer: &P) {}
 }

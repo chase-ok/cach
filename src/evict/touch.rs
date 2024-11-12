@@ -1,41 +1,63 @@
+use std::ops::Deref;
+
+use crate::layer;
+use crate::lock::UpgradeReadGuard;
+
 use super::index::Key;
 use super::list::List;
-use super::{Evict, TouchLockHint, UpgradeReadGuard};
 
 #[derive(Debug)]
 pub struct EvictLeastRecentlyTouched;
 
-impl<P: Clone> Evict<P> for EvictLeastRecentlyTouched {
+pub struct Shard<P>(List<P>);
+
+impl<P: Deref + Clone> layer::Layer<P> for EvictLeastRecentlyTouched {
     type Value = Key;
-    type Queue = List<P>;
+    type Shard = Shard<P>;
 
-    const TOUCH_LOCK_HINT: TouchLockHint = TouchLockHint::RequireWrite;
+    fn new_shard(&self, capacity: usize) -> Self::Shard {
+        Shard(List::with_capacity(capacity))
+    }
+}
 
-    fn new_queue(&mut self, capacity: usize) -> Self::Queue {
-        List::with_capacity(capacity)
+impl<P: Clone + Deref> layer::Shard<P> for Shard<P> {
+    type Value = Key;
+
+    fn write<R: layer::Resolve<P, Self::Value>>(
+        &mut self,
+        mut write: impl layer::Write<P, Self::Value>,
+    ) -> P {
+        if self.0.len() == self.0.capacity() {
+            if let Some(removed) = self.0.pop_head() {
+                write.remove(&removed);
+            }
+        }
+
+        self.0.push_tail_with_key(|key| write.insert(key)).clone()
     }
 
-    fn insert(
-        &self,
-        queue: &mut Self::Queue,
-        construct: impl FnOnce(Self::Value) -> P,
-        _deref: impl Fn(&P) -> &Self::Value,
-    ) -> (P, impl Iterator<Item = P>) {
-        let (value, removed) = queue.push_tail_with_key_and_pop_if_full(construct);
-        (value.clone(), removed.into_iter())
+    fn remove<R: layer::Resolve<P, Self::Value>>(&mut self, pointer: &P) {
+        let _ = self.0.remove(*R::resolve(pointer));
+        // XX: debug assert?
     }
 
-    fn touch(
-        &self,
-        queue: impl UpgradeReadGuard<Target = Self::Queue>,
+    const READ_LOCK_BEHAVIOR: layer::ReadLockBehavior = layer::ReadLockBehavior::RequireWriteLock;
+
+    fn read<'a, R: layer::Resolve<P, Self::Value>>(
+        this: impl crate::lock::UpgradeReadGuard<Target = Self>,
         pointer: &P,
-        deref: impl Fn(&P) -> &Self::Value,
-    ) {
-        UpgradeReadGuard::upgrade(queue).move_to_tail(*deref(pointer));
+    ) -> layer::ReadResult {
+        // XX: doc that require write lock => atomic!
+        // XX: need to that value isn't removed in between
+        this.atomic_upgrade().0.move_to_tail(*R::resolve(pointer));
+        layer::ReadResult::Retain
     }
 
-    fn remove(&self, queue: &mut Self::Queue, pointer: &P, deref: impl Fn(&P) -> &Self::Value) {
-        let removed = queue.remove(*deref(pointer));
-        debug_assert!(removed.is_some());
+    fn iter_read<R: layer::Resolve<P, Self::Value>>(
+        _this: impl crate::lock::UpgradeReadGuard<Target = Self>,
+        _pointer: &P,
+    ) -> layer::ReadResult {
+        // Don't shuffle read order based on iter()
+        layer::ReadResult::Retain
     }
 }
