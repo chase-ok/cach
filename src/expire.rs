@@ -5,10 +5,9 @@ use std::{
 };
 
 use crate::{
-    layer::{Layer, ReadLockBehavior, ReadResult, Resolve, Shard, Write},
-    lock::UpgradeReadGuard,
+    layer::{Layer, ReadLock, ReadResult, Resolve, Shard, Write},
     time::AtomicInstant,
-    Clock, DefaultClock, 
+    Clock, DefaultClock,
 };
 
 pub trait Expire {
@@ -42,12 +41,11 @@ where
         write.insert(())
     }
 
-    const READ_LOCK_BEHAVIOR: ReadLockBehavior = ReadLockBehavior::ReadLockOnly;
+    fn remove<R>(&mut self, _pointer: &P) {}
 
-    fn read<'a, R: Resolve<P, Self::Value>>(
-        _this: impl UpgradeReadGuard<Target = Self>,
-        pointer: &P,
-    ) -> ReadResult {
+    const READ_LOCK: ReadLock = ReadLock::Ref;
+
+    fn read_ref<R: Resolve<P, Self::Value>>(&self, pointer: &P) -> ReadResult {
         if pointer.is_expired() {
             ReadResult::Remove
         } else {
@@ -55,7 +53,11 @@ where
         }
     }
 
-    fn remove<R>(&mut self, _pointer: &P) {}
+    const ITER_READ_LOCK: ReadLock = ReadLock::Ref;
+
+    fn iter_read_ref<R: Resolve<P, Self::Value>>(&self, pointer: &P) -> ReadResult {
+        self.read_ref::<R>(pointer)
+    }
 }
 
 pub trait ExpireAt {
@@ -97,20 +99,23 @@ where
         write.insert(())
     }
 
-    const READ_LOCK_BEHAVIOR: ReadLockBehavior = ReadLockBehavior::ReadLockOnly;
+    fn remove<R: Resolve<P, Self::Value>>(&mut self, _pointer: &P) {}
 
-    fn read<'a, R: Resolve<P, Self::Value>>(
-        this: impl UpgradeReadGuard<Target = Self>,
-        pointer: &P,
-    ) -> ReadResult {
-        if pointer.expire_at() <= this.0.now() {
+    const READ_LOCK: ReadLock = ReadLock::Ref;
+
+    fn read_ref<R: Resolve<P, Self::Value>>(&self, pointer: &P) -> ReadResult {
+        if pointer.expire_at() <= self.0.now() {
             ReadResult::Remove
         } else {
             ReadResult::Retain
         }
     }
 
-    fn remove<R>(&mut self, _pointer: &P) {}
+    const ITER_READ_LOCK: ReadLock = ReadLock::Ref;
+
+    fn iter_read_ref<R: Resolve<P, Self::Value>>(&self, pointer: &P) -> ReadResult {
+        self.read_ref::<R>(pointer)
+    }
 }
 
 #[derive(Debug)]
@@ -164,20 +169,23 @@ where
         write.insert(expire)
     }
 
-    const READ_LOCK_BEHAVIOR: ReadLockBehavior = ReadLockBehavior::ReadLockOnly;
+    fn remove<R>(&mut self, _pointer: &P) {}
 
-    fn read<'a, R: Resolve<P, Self::Value>>(
-        this: impl UpgradeReadGuard<Target = Self>,
-        pointer: &P,
-    ) -> ReadResult {
-        if *R::resolve(pointer) <= this.0.clock.now() {
+    const READ_LOCK: ReadLock = ReadLock::Ref;
+
+    fn read_ref<R: Resolve<P, Self::Value>>(&self, pointer: &P) -> ReadResult {
+        if *R::resolve(pointer) <= self.0.clock.now() {
             ReadResult::Remove
         } else {
             ReadResult::Retain
         }
     }
 
-    fn remove<R>(&mut self, _pointer: &P) {}
+    const ITER_READ_LOCK: ReadLock = ReadLock::Ref;
+
+    fn iter_read_ref<R: Resolve<P, Self::Value>>(&self, pointer: &P) -> ReadResult {
+        self.read_ref::<R>(pointer)
+    }
 }
 
 #[derive(Debug)]
@@ -231,21 +239,24 @@ where
         write.insert(expire.into())
     }
 
-    const READ_LOCK_BEHAVIOR: ReadLockBehavior = ReadLockBehavior::ReadLockOnly;
+    fn remove<R>(&mut self, _pointer: &P) {}
 
-    fn read<'a, R: Resolve<P, Self::Value>>(
-        this: impl UpgradeReadGuard<Target = Self>,
-        pointer: &P,
-    ) -> ReadResult {
-        let now = this.0.clock.now();
+    const READ_LOCK: ReadLock = ReadLock::Ref;
+
+    fn read_ref<R: Resolve<P, Self::Value>>(&self, pointer: &P) -> ReadResult {
+        let now = self.0.clock.now();
         let expire =
-            R::resolve(pointer).swap((this.0.expire_at_fn)(now, &pointer), Ordering::Relaxed);
-        if expire <= this.0.clock.now() {
+            R::resolve(pointer).swap((self.0.expire_at_fn)(now, &pointer), Ordering::Relaxed);
+        if expire <= now {
             ReadResult::Remove
         } else {
             ReadResult::Retain
         }
     }
 
-    fn remove<R>(&mut self, _pointer: &P) {}
+    const ITER_READ_LOCK: ReadLock = ReadLock::Ref;
+
+    fn iter_read_ref<R: Resolve<P, Self::Value>>(&self, pointer: &P) -> ReadResult {
+        self.read_ref::<R>(pointer)
+    }
 }

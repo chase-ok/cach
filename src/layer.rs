@@ -2,9 +2,9 @@ use std::{marker::PhantomData, ops::Deref};
 
 use smallvec::SmallVec;
 
-use crate::lock::{MapUpgradeReadGuard, UpgradeReadGuard, UpgradeReadGuardCell};
+// XX wrap pub behind raw feature
 
-pub(crate) trait Layer<P: Deref> {
+pub trait Layer<P: Deref> {
     type Value: 'static;
     type Shard: Shard<P, Value = Self::Value>;
 
@@ -19,61 +19,77 @@ pub(crate) trait Layer<P: Deref> {
     }
 }
 
-pub(crate) trait Shard<P: Deref>: Sized {
+pub trait Shard<P: Deref>: Sized {
     type Value: 'static;
 
     fn write<R: Resolve<P, Self::Value>>(&mut self, write: impl Write<P, Self::Value>) -> P;
 
-    // XX document ReadResult::Remove + ReadOnly as rare?
-    const READ_LOCK_BEHAVIOR: ReadLockBehavior;
+    fn remove<R: Resolve<P, Self::Value>>(&mut self, pointer: &P);
+
+    const READ_LOCK: ReadLock;
 
     /// If result is remove, remove() will be called after with the same pointer
     #[inline]
-    fn read<'a, R: Resolve<P, Self::Value>>(
-        _this: impl UpgradeReadGuard<Target = Self>,
-        _pointer: &P,
-    ) -> ReadResult {
+    fn read_ref<R: Resolve<P, Self::Value>>(&self, _pointer: &P) -> ReadResult {
         ReadResult::Retain
     }
 
     #[inline]
-    fn iter_read<R: Resolve<P, Self::Value>>(
-        this: impl UpgradeReadGuard<Target = Self>,
-        pointer: &P,
-    ) -> ReadResult {
-        Self::read::<R>(this, pointer)
+    fn read_mut<R: Resolve<P, Self::Value>>(&mut self, pointer: &P) -> ReadResult {
+        self.read_ref::<R>(pointer)
     }
 
-    fn remove<R: Resolve<P, Self::Value>>(&mut self, pointer: &P);
+    const ITER_READ_LOCK: ReadLock;
+
+    #[inline]
+    fn iter_read_ref<R: Resolve<P, Self::Value>>(&self, _pointer: &P) -> ReadResult {
+        ReadResult::Retain
+    }
+
+    #[inline]
+    fn iter_read_mut<R: Resolve<P, Self::Value>>(&mut self, pointer: &P) -> ReadResult {
+        self.iter_read_ref::<R>(pointer)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadResult {
+pub enum ReadLock {
+    None,
+    Ref,
+    Mut,
+}
+
+impl ReadLock {
+    pub const fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Mut, _) | (_, Self::Mut) => Self::Mut,
+            (Self::Ref, _) | (_, Self::Ref) => Self::Ref,
+            _ => Self::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadResult {
     Retain,
     Remove,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadLockBehavior {
-    ReadLockOnly,
-    RequireWriteLock,
-}
-
-impl ReadLockBehavior {
-    const fn and(self, other: Self) -> Self {
+impl ReadResult {
+    pub const fn or(self, other: Self) -> Self {
         match (self, other) {
-            (Self::RequireWriteLock, _) | (_, Self::RequireWriteLock) => Self::RequireWriteLock,
-            _ => Self::ReadLockOnly,
+            (Self::Remove, _) | (_, Self::Remove) => Self::Remove,
+            _ => Self::Retain,
         }
     }
 }
 
 // XX: can't fold into P to avoid type cycle
-pub(crate) trait Resolve<P, V> {
+pub trait Resolve<P, V> {
     fn resolve(pointer: &P) -> &V;
 }
 
-pub(crate) trait Write<P: Deref, V> {
+pub trait Write<P: Deref, V> {
     fn target(&self) -> &P::Target;
     fn remove(&mut self, pointer: &P);
     fn insert(self, value: V) -> P;
@@ -100,10 +116,11 @@ impl<P: Deref> Shard<P> for LayerNone {
         write.insert(())
     }
 
-    const READ_LOCK_BEHAVIOR: ReadLockBehavior = ReadLockBehavior::ReadLockOnly;
-
     #[inline]
     fn remove<R>(&mut self, _pointer: &P) {}
+
+    const READ_LOCK: ReadLock = ReadLock::None;
+    const ITER_READ_LOCK: ReadLock = ReadLock::None;
 }
 
 pub struct AndThen<A, B>(A, B);
@@ -143,6 +160,8 @@ where
         &R::resolve(pointer).0
     }
 }
+
+// XX: rename A/B to 0/1?
 
 struct ResolveB<R, A, B>(PhantomData<(R, A, B)>);
 impl<P, R, A, B> Resolve<P, B> for ResolveB<R, A, B>
@@ -260,41 +279,23 @@ where
         self.1.remove::<ResolveB<R, _, _>>(pointer);
     }
 
-    const READ_LOCK_BEHAVIOR: ReadLockBehavior = A::READ_LOCK_BEHAVIOR.and(B::READ_LOCK_BEHAVIOR);
+    const READ_LOCK: ReadLock = A::READ_LOCK.or(B::READ_LOCK);
 
-    #[inline]
-    fn read<'a, R: Resolve<P, Self::Value>>(
-        this: impl UpgradeReadGuard<Target = Self>,
-        pointer: &P,
-    ) -> ReadResult {
-        let mut this = UpgradeReadGuardCell::new(this);
-
-        let this_a = MapUpgradeReadGuard::new(this.guard(), |s| &s.0, |s| &mut s.0);
-        let result_a = A::read::<ResolveA<R, _, _>>(this_a, pointer);
-        match result_a {
-            ReadResult::Remove => result_a,
-            ReadResult::Retain => {
-                let this_b = MapUpgradeReadGuard::new(this.guard(), |s| &s.1, |s| &mut s.1);
-                B::read::<ResolveB<R, _, _>>(this_b, pointer)
-            }
-        }
+    fn read_ref<R: Resolve<P, Self::Value>>(&self, pointer: &P) -> ReadResult {
+        self.0.read_ref::<ResolveA<R, _, _>>(pointer).or(self.1.read_ref::<ResolveB<R, _, _>>(pointer))
     }
 
-    #[inline]
-    fn iter_read<R: Resolve<P, Self::Value>>(
-        this: impl UpgradeReadGuard<Target = Self>,
-        pointer: &P,
-    ) -> ReadResult {
-        let mut this = UpgradeReadGuardCell::new(this);
+    fn read_mut<R: Resolve<P, Self::Value>>(&mut self, pointer: &P) -> ReadResult {
+        self.0.read_mut::<ResolveA<R, _, _>>(pointer).or(self.1.read_mut::<ResolveB<R, _, _>>(pointer))
+    }
 
-        let this_a = MapUpgradeReadGuard::new(this.guard(), |s| &s.0, |s| &mut s.0);
-        let result_a = A::iter_read::<ResolveA<R, _, _>>(this_a, pointer);
-        match result_a {
-            ReadResult::Remove => result_a,
-            ReadResult::Retain => {
-                let this_b = MapUpgradeReadGuard::new(this.guard(), |s| &s.1, |s| &mut s.1);
-                B::iter_read::<ResolveB<R, _, _>>(this_b, pointer)
-            }
-        }
+    const ITER_READ_LOCK: ReadLock = A::ITER_READ_LOCK.or(B::ITER_READ_LOCK);
+
+    fn iter_read_ref<R: Resolve<P, Self::Value>>(&self, pointer: &P) -> ReadResult {
+        self.0.iter_read_ref::<ResolveA<R, _, _>>(pointer).or(self.1.iter_read_ref::<ResolveB<R, _, _>>(pointer))
+    }
+
+    fn iter_read_mut<R: Resolve<P, Self::Value>>(&mut self, pointer: &P) -> ReadResult {
+        self.0.iter_read_mut::<ResolveA<R, _, _>>(pointer).or(self.1.iter_read_mut::<ResolveB<R, _, _>>(pointer))
     }
 }

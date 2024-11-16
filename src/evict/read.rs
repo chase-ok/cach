@@ -1,17 +1,16 @@
 use std::ops::Deref;
 
 use crate::layer;
-use crate::lock::UpgradeReadGuard;
 
 use super::index::Key;
 use super::list::List;
 
 #[derive(Debug)]
-pub struct EvictLeastRecentlyTouched;
+pub struct EvictLeastRecentlyRead;
 
 pub struct Shard<P>(List<P>);
 
-impl<P: Deref + Clone> layer::Layer<P> for EvictLeastRecentlyTouched {
+impl<P: Deref + Clone> layer::Layer<P> for EvictLeastRecentlyRead {
     type Value = Key;
     type Shard = Shard<P>;
 
@@ -41,23 +40,16 @@ impl<P: Clone + Deref> layer::Shard<P> for Shard<P> {
         // XX: debug assert?
     }
 
-    const READ_LOCK_BEHAVIOR: layer::ReadLockBehavior = layer::ReadLockBehavior::RequireWriteLock;
+    const READ_LOCK: layer::ReadLock = layer::ReadLock::Mut;
 
-    fn read<'a, R: layer::Resolve<P, Self::Value>>(
-        this: impl crate::lock::UpgradeReadGuard<Target = Self>,
-        pointer: &P,
-    ) -> layer::ReadResult {
-        // XX: doc that require write lock => atomic!
-        // XX: need to that value isn't removed in between
-        this.atomic_upgrade().0.move_to_tail(*R::resolve(pointer));
+    fn read_ref<R: layer::Resolve<P, Self::Value>>(&self, _pointer: &P) -> layer::ReadResult {
+        unreachable!()
+    }
+
+    fn read_mut<R: layer::Resolve<P, Self::Value>>(&mut self, pointer: &P) -> layer::ReadResult {
+        self.0.move_to_tail(*R::resolve(pointer));
         layer::ReadResult::Retain
     }
 
-    fn iter_read<R: layer::Resolve<P, Self::Value>>(
-        _this: impl crate::lock::UpgradeReadGuard<Target = Self>,
-        _pointer: &P,
-    ) -> layer::ReadResult {
-        // Don't shuffle read order based on iter()
-        layer::ReadResult::Retain
-    }
+    const ITER_READ_LOCK: layer::ReadLock = layer::ReadLock::None;
 }

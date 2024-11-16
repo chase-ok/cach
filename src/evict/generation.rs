@@ -4,13 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use smallvec::SmallVec;
-use stable_deref_trait::CloneStableDeref;
 
-use crate::{
-    lock::{MapUpgradeReadGuard, UpgradeReadGuard},
-    time::{Clock, DefaultClock},
-};
+use crate::time::{Clock, DefaultClock};
 
 pub trait Promote {
     type Value: 'static;

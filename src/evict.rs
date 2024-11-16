@@ -1,10 +1,8 @@
-use crate::lock::UpgradeReadGuard;
 
-mod approx;
 pub mod generation;
-pub mod touch;
+pub mod read;
 pub mod write;
-// pub mod multi;
+pub mod multi;
 
 #[cfg(feature = "rand")]
 pub mod random;
@@ -14,5 +12,3 @@ mod bag;
 
 mod index;
 mod list;
-
-pub use approx::EvictApproximate;

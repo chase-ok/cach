@@ -8,7 +8,6 @@ pub mod build;
 pub mod evict;
 pub mod expire;
 pub mod local;
-pub mod lock;
 pub mod map;
 pub mod sync;
 pub mod time;
@@ -35,6 +34,20 @@ pub trait Cache<T: Value> {
     where
         T::Key: Borrow<K>,
         K: ?Sized + Hash + Eq;
+    
+    fn try_entry<'c, 'k, K>(
+        &'c self,
+        key: &'k K,
+    ) -> Option<Entry<
+        impl OccupiedEntry<Pointer = Self::Pointer> + 'c,
+        impl VacantEntry<Pointer = Self::Pointer> + 'c,
+    >>
+    where
+        T::Key: Borrow<K>,
+        K: ?Sized + Hash + Eq
+    {
+        Some(self.entry(key))
+    }
 
     fn insert(&self, value: T) -> Self::Pointer {
         match self.entry(value.key()) {
@@ -109,6 +122,7 @@ pub trait Cache<T: Value> {
     }
 }
 
+#[derive(Debug)]
 pub enum Entry<O, V> {
     Occupied(O),
     Vacant(V),

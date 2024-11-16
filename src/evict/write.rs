@@ -32,10 +32,11 @@ impl<P: Clone + Deref> layer::Shard<P> for Shard<P> {
         self.0.push_tail_with_key(|key| write.insert(key)).clone()
     }
 
-    const READ_LOCK_BEHAVIOR: layer::ReadLockBehavior = layer::ReadLockBehavior::ReadLockOnly;
-
     fn remove<R: layer::Resolve<P, Self::Value>>(&mut self, pointer: &P) {
         let _ = self.0.remove(*R::resolve(pointer));
         // XX debug assert?
     }
+
+    const READ_LOCK: layer::ReadLock = layer::ReadLock::None;
+    const ITER_READ_LOCK: layer::ReadLock = layer::ReadLock::None;
 }

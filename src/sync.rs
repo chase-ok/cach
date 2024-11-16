@@ -1,7 +1,6 @@
 use std::{
     borrow::Borrow,
     hash::{BuildHasher, Hash},
-    marker::PhantomData,
     ops::Deref,
     sync::Arc,
     usize,
@@ -16,8 +15,7 @@ use parking_lot::{RwLock, RwLockWriteGuard};
 use stable_deref_trait::{CloneStableDeref, StableDeref};
 
 use crate::{
-    layer::{Layer, LayerNone, ReadLockBehavior, ReadResult, Resolve, Shard as ShardLayer},
-    lock::{MapUpgradeReadGuard, UpgradeReadGuard, UpgradeReadGuardCell},
+    layer::{self, Layer, ReadResult, Resolve, Shard as ShardLayer},
     Cache,
 };
 
@@ -88,7 +86,7 @@ impl<S> SyncCacheBuilder<S> {
     }
 
     pub fn build_with_layer<T, L, Lv, Ls>(self, layer: L) -> SyncCache<T, Lv, Ls, S>
-    where 
+    where
         T: crate::Value,
         L: Layer<Pointer<T, Lv>, Value = Lv, Shard = Ls>,
     {
@@ -162,8 +160,6 @@ pub struct SyncCache<T, Lv, Ls, S = DefaultHashBuilder> {
     capacity_per_shard: usize,
 }
 
-
-
 struct Shard<T, Lv, Ls> {
     values: RawTable<Pointer<T, Lv>>,
     layer: Ls,
@@ -221,7 +217,7 @@ where
     fn iter(&self) -> impl Iterator<Item = Self::Pointer> {
         self.shards.iter().flat_map(|shard| {
             let mut pointers = Vec::new();
-            'attempt: loop {
+            loop {
                 pointers.clear();
 
                 // XX
@@ -234,34 +230,37 @@ where
                 const CHUNK: usize = 256;
                 let mut i = 0;
                 while i < buckets_len {
-                    // XX: typical case = 1 iterating thread, ok to use upgradable read since we don't block
-                    // need atomic upgrade for efficiently deleting
-                    let mut shard = UpgradeReadGuardCell::new(shard.upgradable_read());
-
-                    if shard.values.buckets() != buckets_len {
-                        continue 'attempt; // resized in between
-                    }
-
-                    for bucket in i..buckets_len.min(i + CHUNK) {
-                        // XX safety
-                        if unsafe { shard.values.is_bucket_full(bucket) } {
-                            // XX safety
-                            let bucket = unsafe { shard.values.bucket(bucket) };
-                            // XX safety
-                            let pointer = unsafe { bucket.as_ref() }.clone();
-
-                            let layer = MapUpgradeReadGuard::new(shard.guard(), |s| &s.layer, |s| &mut s.layer);
-                            match Ls::iter_read::<ResolveLayer>(layer, &pointer) {
-                                ReadResult::Retain => {
+                    match Ls::ITER_READ_LOCK {
+                        layer::ReadLock::None => {
+                            let shard = shard.read();
+                            for bucket in i..buckets_len.min(i + CHUNK) {
+                                // XX safety
+                                if unsafe { shard.values.is_bucket_full(bucket) } {
+                                    // XX safety
+                                    let bucket = unsafe { shard.values.bucket(bucket) };
+                                    // XX safety
+                                    let pointer = unsafe { bucket.as_ref() }.clone();
                                     pointers.push(pointer);
                                 }
-                                ReadResult::Remove => {
-                                    // XX atomic safety
-                                    let mut shard = shard.guard().atomic_upgrade();
-                                    shard.layer.remove::<ResolveLayer>(&pointer);
+                            }
+                        }
+                        layer::ReadLock::Ref | layer::ReadLock::Mut => {
+                            let mut shard = shard.write(); // don't try to upgrade later to a write lock on ::Remove
+                            for bucket in i..buckets_len.min(i + CHUNK) {
+                                // XX safety
+                                if unsafe { shard.values.is_bucket_full(bucket) } {
                                     // XX safety
-                                    unsafe {
-                                        shard.values.remove(bucket);
+                                    let bucket = unsafe { shard.values.bucket(bucket) };
+                                    // XX safety
+                                    let pointer = unsafe { bucket.as_ref() };
+                                    match shard.layer.iter_read_mut::<ResolveLayer>(pointer) {
+                                        ReadResult::Retain => pointers.push(pointer.clone()),
+                                        ReadResult::Remove => {
+                                            shard.layer.remove::<ResolveLayer>(pointer);
+                                            unsafe {
+                                                shard.values.remove(bucket);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -274,47 +273,6 @@ where
             }
             pointers
         })
-        // struct Iter<I, T, Lv, Ls> {
-        //     iter: I,
-        //     pointers: Vec<Pointer<T, Lv>>,
-        //     _marker: PhantomData<Ls>,
-        // }
-
-        // impl<'a, I, T: 'a, Lv: 'a, Ls: 'a> Iterator for Iter<I, T, Lv, Ls>
-        // where
-        //     I: Iterator<Item = &'a CachePadded<RwLock<Shard<T, Lv, Ls>>>>,
-        //     Ls: ShardLayer<Pointer<T, Lv>, Value = Lv>,
-        // {
-        //     type Item = Pointer<T, Lv>;
-
-        //     fn next(&mut self) -> Option<Self::Item> {
-        //         loop {
-        //             if let Some(pointer) = self.pointers.pop() {
-        //                 return Some(pointer);
-        //             } else if let Some(shard) = self.iter.next() {
-        //                 match Ls::READ_LOCK_BEHAVIOR {
-        //                     ReadLockBehavior::ReadLockOnly => todo!(),
-        //                     ReadLockBehavior::RequireWriteLock => {
-        //                         let shard = shard.write();
-        //                         shard.values.is_bucket_full(index)
-        //                     }
-        //                 }
-        //                 // XX safety
-        //                 self.pointers.extend(unsafe {
-        //                     shard.read().values.iter().map(|b| b.as_ref().clone())
-        //                 });
-        //             } else {
-        //                 return None;
-        //             }
-        //         }
-        //     }
-        // }
-
-        // Iter {
-        //     iter: self.shards.iter(),
-        //     pointers: Vec::with_capacity(self.capacity_per_shard),
-        //     _marker: PhantomData,
-        // }
     }
 
     fn get<K>(&self, key: &K) -> Option<Self::Pointer>
@@ -322,51 +280,71 @@ where
         T::Key: Borrow<K>,
         K: ?Sized + Hash + std::cmp::Eq,
     {
-        let (hash, shard) = self.hash_and_shard(key);
-        match Ls::READ_LOCK_BEHAVIOR {
-            ReadLockBehavior::ReadLockOnly => {
-                let shard = self.shards[shard].read();
-                let pointer = shard
-                    .values
-                    .get(hash, |p| p.0.value.key().borrow() == key)?
-                    .clone();
-
-                let mut cell = UpgradeReadGuardCell::new(shard);
-                let layer_shard =
-                    MapUpgradeReadGuard::new(cell.guard(), |s| &s.layer, |s| &mut s.layer);
-                match Ls::read::<ResolveLayer>(layer_shard, &pointer) {
-                    ReadResult::Retain => Some(pointer),
-                    ReadResult::Remove => {
-                        let mut shard = cell.guard().upgrade();
-                        // XX: need to re-look up because someone else might've beat us to the write lock
-                        let pointer = shard
-                            .values
-                            .remove_entry(hash, |p| Arc::ptr_eq(&p.0, &pointer.0))?;
-                        shard.layer.remove::<ResolveLayer>(&pointer);
-                        Some(pointer)
-                    }
-                }
+        match Ls::READ_LOCK {
+            layer::ReadLock::None => {
+                let (hash, shard_index) = self.hash_and_shard(key);
+                Some(
+                    self.shards[shard_index]
+                        .read()
+                        .values
+                        .get(hash, |p| p.0.value.key().borrow() == key)?
+                        .clone(),
+                )
             }
-
-            ReadLockBehavior::RequireWriteLock => {
-                let mut shard = self.shards[shard].write();
+            layer::ReadLock::Ref => {
+                let (hash, shard_index) = self.hash_and_shard(key);
+                let shard = self.shards[shard_index].read();
                 let bucket = shard
                     .values
                     .find(hash, |p| p.0.value.key().borrow() == key)?;
                 // XX: safety
-                let pointer = unsafe { bucket.as_ref() };
-                match Ls::read::<ResolveLayer>(&mut shard.layer, &pointer) {
-                    ReadResult::Retain => Some(pointer.clone()),
+                let pointer = unsafe { bucket.as_ref() }.clone();
+
+                match shard.layer.read_ref::<ResolveLayer>(&pointer) {
+                    ReadResult::Retain => Some(pointer),
                     ReadResult::Remove => {
-                        shard.layer.remove::<ResolveLayer>(pointer);
-                        // XX: safety
-                        unsafe {
-                            shard.values.remove(bucket);
+                        // need to look it up again in case someone else deleted it first!
+                        // XX safety
+                        let bucket_index = unsafe { shard.values.bucket_index(&bucket) };
+                        let buckets_len = shard.values.buckets();
+                        drop(shard);
+
+                        // XX: bucket not safe to read
+                        let mut shard = self.shards[shard_index].write();
+                        if shard.values.buckets() > buckets_len {
+                            // we grew in between
+                            if shard
+                                .values
+                                .remove_entry(hash, |p| Arc::ptr_eq(&p.0, &pointer.0))
+                                .is_some()
+                            {
+                                shard.layer.remove::<ResolveLayer>(&pointer);
+                            }
+                        } else if shard.values.buckets() == buckets_len {
+                            // XX safety
+                            if unsafe { shard.values.is_bucket_full(bucket_index) } {
+                                // XX safety
+                                let bucket = unsafe { shard.values.bucket(bucket_index) };
+                                // XX safety
+                                if Arc::ptr_eq(&unsafe { bucket.as_ref() }.0, &pointer.0) {
+                                    unsafe {
+                                        shard.values.remove(bucket);
+                                    }
+                                    shard.layer.remove::<ResolveLayer>(&pointer);
+                                }
+                            }
+                        } else {
+                            unreachable!("map should never shrink");
                         }
+
                         None
                     }
                 }
             }
+            layer::ReadLock::Mut => match self.entry(key) {
+                crate::Entry::Occupied(o) => Some(crate::OccupiedEntry::into_pointer(o)),
+                crate::Entry::Vacant(_) => todo!(),
+            },
         }
     }
 
@@ -393,7 +371,7 @@ where
             Ok(bucket) => {
                 // XX safety
                 let pointer = unsafe { bucket.as_ref() };
-                match Ls::read::<ResolveLayer>(&mut shard.layer, pointer) {
+                match Ls::read_mut::<ResolveLayer>(&mut shard.layer, pointer) {
                     ReadResult::Retain => crate::Entry::Occupied(OccupiedEntry {
                         cache: self,
                         shard,
@@ -436,54 +414,6 @@ where
         let shard = (shard as usize) & self.mask;
         (hash, shard)
     }
-
-    // fn check_read(&self, shard_index: usize) {
-    //     match Ls::READ_LOCK_BEHAVIOR {
-    //         ReadLockBehavior::ReadLockOnly => {
-    //             let shard = self.shards[shard_index].read();
-    //             let pointer = shard
-    //                 .values
-    //                 .get(hash, |p| p.0.value.key().borrow() == key)?
-    //                 .clone();
-
-    //             let mut cell = UpgradeReadGuardCell::new(shard);
-    //             let layer_shard =
-    //                 MapUpgradeReadGuard::new(cell.borrow_ref(), |s| &s.layer, |s| &mut s.layer);
-    //             match Ls::read::<ResolveLayer>(layer_shard, &pointer) {
-    //                 ReadResult::Retain => Some(pointer),
-    //                 ReadResult::Remove => {
-    //                     let mut shard = cell.borrow_ref().upgrade();
-    //                     // XX: need to re-look up because someone else might've beat us to the write lock
-    //                     let pointer = shard
-    //                         .values
-    //                         .remove_entry(hash, |p| p.0.value.key().borrow() == key)?;
-    //                     shard.layer.remove::<ResolveLayer>(&pointer);
-    //                     Some(pointer)
-    //                 }
-    //             }
-    //         }
-
-    //         ReadLockBehavior::RequireWriteLock => {
-    //             let mut shard = self.shards[shard].write();
-    //             let bucket = shard
-    //                 .values
-    //                 .find(hash, |p| p.0.value.key().borrow() == key)?;
-    //             // XX: safety
-    //             let pointer = unsafe { bucket.as_ref() };
-    //             match Ls::read::<ResolveLayer>(&mut shard.layer, &pointer) {
-    //                 ReadResult::Retain => Some(pointer.clone()),
-    //                 ReadResult::Remove => {
-    //                     shard.layer.remove::<ResolveLayer>(pointer);
-    //                     // XX: safety
-    //                     unsafe {
-    //                         shard.values.remove(bucket);
-    //                     }
-    //                     None
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
 }
 
 struct OccupiedEntry<'a, T: crate::Value, Lv, Ls, S> {
@@ -549,7 +479,7 @@ struct Write<'a, T, Lv, Ls, S> {
     target: T,
 }
 
-impl<T, Lv, Ls, S> crate::layer::Write<Pointer<T, Lv>, Lv> for Write<'_, T, Lv, Ls, S>
+impl<T, Lv, Ls, S> layer::Write<Pointer<T, Lv>, Lv> for Write<'_, T, Lv, Ls, S>
 where
     T: crate::Value,
     Ls: ShardLayer<Pointer<T, Lv>, Value = Lv>,
