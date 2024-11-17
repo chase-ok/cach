@@ -2,6 +2,9 @@ use std::{marker::PhantomData, ops::Deref};
 
 use smallvec::SmallVec;
 
+mod multi;
+pub use multi::MultiLayer;
+
 // XX wrap pub behind raw feature
 
 pub trait Layer<P: Deref> {
@@ -17,9 +20,29 @@ pub trait Layer<P: Deref> {
     {
         AndThen(self, next)
     }
+
+    fn or_if<N, K>(self, key_fn: K, next: N) -> MultiLayer<K, Self, N> 
+    where 
+        Self: Sized,
+        N: Layer<P>,
+        K: Clone + Fn(&P::Target) -> bool,
+    {
+        MultiLayer::new(key_fn, self, next)
+    }
+
+    fn with_capacity_fraction(self, fraction: f32) -> LayerCapacityFraction<Self> 
+    where 
+        Self: Sized
+    {
+        LayerCapacityFraction {
+            layer: self,
+            fraction,
+        }
+    }
+
 }
 
-pub trait Shard<P: Deref>: Sized {
+pub trait Shard<P: Deref> {
     type Value: 'static;
 
     fn write<R: Resolve<P, Self::Value>>(&mut self, write: impl Write<P, Self::Value>) -> P;
@@ -92,7 +115,7 @@ pub trait Resolve<P, V> {
 pub trait Write<P: Deref, V> {
     fn target(&self) -> &P::Target;
     fn remove(&mut self, pointer: &P);
-    fn insert(self, value: V) -> P;
+    fn write(self, value: V) -> P;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -113,7 +136,7 @@ impl<P: Deref> Shard<P> for LayerNone {
 
     #[inline]
     fn write<R>(&mut self, write: impl Write<P, Self::Value>) -> P {
-        write.insert(())
+        write.write(())
     }
 
     #[inline]
@@ -121,6 +144,20 @@ impl<P: Deref> Shard<P> for LayerNone {
 
     const READ_LOCK: ReadLock = ReadLock::None;
     const ITER_READ_LOCK: ReadLock = ReadLock::None;
+}
+
+pub struct LayerCapacityFraction<L> {
+    layer: L,
+    fraction: f32,
+}
+
+impl<P: Deref, L: Layer<P>> Layer<P> for LayerCapacityFraction<L> {
+    type Value = L::Value;
+    type Shard = L::Shard;
+
+    fn new_shard(&self, capacity: usize) -> Self::Shard {
+        self.layer.new_shard(((capacity as f32 * self.fraction).round() as usize).max(1))
+    }
 }
 
 pub struct AndThen<A, B>(A, B);
@@ -216,7 +253,7 @@ where
                 self.inner.remove(pointer);
             }
 
-            fn insert(self, b: B::Value) -> P {
+            fn write(self, b: B::Value) -> P {
                 struct WriteA<'a, P, R, W, B> {
                     _resolve: PhantomData<R>,
                     inner: W,
@@ -242,8 +279,8 @@ where
                         self.inner.remove(pointer);
                     }
 
-                    fn insert(self, a: A) -> P {
-                        self.inner.insert((a, self.b))
+                    fn write(self, a: A) -> P {
+                        self.inner.write((a, self.b))
                     }
                 }
 

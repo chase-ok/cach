@@ -38,7 +38,7 @@ where
     type Value = ();
 
     fn write<R>(&mut self, write: impl Write<P, Self::Value>) -> P {
-        write.insert(())
+        write.write(())
     }
 
     fn remove<R>(&mut self, _pointer: &P) {}
@@ -96,7 +96,7 @@ where
     type Value = ();
 
     fn write<R>(&mut self, write: impl Write<P, Self::Value>) -> P {
-        write.insert(())
+        write.write(())
     }
 
     fn remove<R: Resolve<P, Self::Value>>(&mut self, _pointer: &P) {}
@@ -166,7 +166,7 @@ where
 
     fn write<R>(&mut self, write: impl Write<P, Self::Value>) -> P {
         let expire = (self.0.expire_at_fn)(self.0.clock.now(), write.target());
-        write.insert(expire)
+        write.write(expire)
     }
 
     fn remove<R>(&mut self, _pointer: &P) {}
@@ -236,7 +236,7 @@ where
 
     fn write<R>(&mut self, write: impl Write<P, Self::Value>) -> P {
         let expire = (self.0.expire_at_fn)(self.0.clock.now(), write.target());
-        write.insert(expire.into())
+        write.write(expire.into())
     }
 
     fn remove<R>(&mut self, _pointer: &P) {}

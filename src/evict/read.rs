@@ -32,7 +32,7 @@ impl<P: Clone + Deref> layer::Shard<P> for Shard<P> {
             }
         }
 
-        self.0.push_tail_with_key(|key| write.insert(key)).clone()
+        self.0.push_tail_with_key(|key| write.write(key)).clone()
     }
 
     fn remove<R: layer::Resolve<P, Self::Value>>(&mut self, pointer: &P) {

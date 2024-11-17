@@ -343,7 +343,7 @@ where
             }
             layer::ReadLock::Mut => match self.entry(key) {
                 crate::Entry::Occupied(o) => Some(crate::OccupiedEntry::into_pointer(o)),
-                crate::Entry::Vacant(_) => todo!(),
+                crate::Entry::Vacant(_) => None,
             },
         }
     }
@@ -498,7 +498,7 @@ where
             .expect("layer shard and map out of sync");
     }
 
-    fn insert(self, layer: Lv) -> Pointer<T, Lv> {
+    fn write(self, layer: Lv) -> Pointer<T, Lv> {
         Pointer(Arc::new(Value {
             value: self.target,
             layer,

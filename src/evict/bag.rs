@@ -39,22 +39,26 @@ impl<T> Bag<T> {
         &self.values[index]
     }
 
-    pub fn insert(&mut self, value: T) -> Key {
-        let index = self.values.len();
-        self.values.push(value);
-        Key(index.into())
-    }
-
-    pub fn remove(&mut self, value: &T, deref: impl Fn(&T) -> &Key) -> T {
+    pub fn remove_by_value(&mut self, value: &T, deref: impl Fn(&T) -> &Key) -> T {
         let key = deref(value);
         // XX: can use relaxed since we have &mut self
         let index = key.0.load(Ordering::Relaxed);
         self.do_remove(index, deref)
     }
 
-    pub fn pop(&mut self, rand: impl FnOnce(usize) -> usize, deref: impl Fn(&T) -> &Key) -> Option<T> {
+    pub fn remove_by_key(&mut self, key: &Key, deref: impl Fn(&T) -> &Key) -> T {
+        // XX: can use relaxed since we have &mut self
+        let index = key.0.load(Ordering::Relaxed);
+        self.do_remove(index, deref)
+    }
+
+    pub fn pop(
+        &mut self,
+        rand: impl FnOnce(usize) -> usize,
+        deref: impl Fn(&T) -> &Key,
+    ) -> Option<T> {
         if self.len() == 0 {
-            return None
+            return None;
         }
 
         let index = rand(self.len());
@@ -73,5 +77,20 @@ impl<T> Bag<T> {
             deref(moved).0.store(index, Ordering::Relaxed);
         }
         removed
+    }
+
+    pub fn iter_random(
+        &self,
+        mut rand: impl FnMut(usize) -> usize,
+        deref: impl Fn(&T) -> &Key,
+    ) -> impl Iterator<Item = (&Key, &T)> {
+        std::iter::repeat_with(move || {
+            let index = rand(self.len());
+            assert!(index < self.len());
+            let value = &self.values[index];
+            (deref(value), value)
+        })
+        // Avoid evaluating repeat_with if we're empty
+        .take(if self.len() == 0 { 0 } else { usize::MAX })
     }
 }
