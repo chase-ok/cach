@@ -35,20 +35,6 @@ pub trait Cache<T: Value> {
         T::Key: Borrow<K>,
         K: ?Sized + Hash + Eq;
     
-    fn try_entry<'c, 'k, K>(
-        &'c self,
-        key: &'k K,
-    ) -> Option<Entry<
-        impl OccupiedEntry<Pointer = Self::Pointer> + 'c,
-        impl VacantEntry<Pointer = Self::Pointer> + 'c,
-    >>
-    where
-        T::Key: Borrow<K>,
-        K: ?Sized + Hash + Eq
-    {
-        Some(self.entry(key))
-    }
-
     fn insert(&self, value: T) -> Self::Pointer {
         match self.entry(value.key()) {
             Entry::Occupied(o) => o.replace(value),
@@ -119,6 +105,16 @@ pub trait Cache<T: Value> {
             Entry::Occupied(o) => Some(o.into_pointer()),
             Entry::Vacant(_) => None,
         }
+    }
+
+    fn refresh_entry<'c, 'k>(&'c self, pointer: &'k Self::Pointer) -> Entry<
+        impl OccupiedEntry<Pointer = Self::Pointer> + 'c,
+        impl VacantEntry<Pointer = Self::Pointer> + 'c,
+    > 
+    where 
+        T: 'k,
+    {
+        self.entry(pointer.key())
     }
 }
 

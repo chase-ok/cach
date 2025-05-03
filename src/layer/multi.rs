@@ -7,6 +7,7 @@ pub struct MultiLayer<K, L0, L1> {
 }
 
 impl<K, L0, L1> MultiLayer<K, L0, L1> {
+    // XX: key_fn => matches or predicate
     pub fn new(key_fn: K, l0: L0, l1: L1) -> Self {
         Self {
             key_fn,

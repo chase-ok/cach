@@ -21,13 +21,13 @@ pub trait Layer<P: Deref> {
         AndThen(self, next)
     }
 
-    fn or_if<N, K>(self, key_fn: K, next: N) -> MultiLayer<K, Self, N> 
+    fn or_else_if<N, K>(self, matches: K, next: N) -> MultiLayer<K, Self, N> 
     where 
         Self: Sized,
         N: Layer<P>,
         K: Clone + Fn(&P::Target) -> bool,
     {
-        MultiLayer::new(key_fn, self, next)
+        MultiLayer::new(matches, self, next)
     }
 
     fn with_capacity_fraction(self, fraction: f32) -> LayerCapacityFraction<Self> 
