@@ -4,18 +4,7 @@ use std::{
     ops::Deref,
 };
 
-pub mod build;
-pub mod evict;
-pub mod expire;
-pub mod local;
-pub mod map;
-pub mod sync;
-pub mod time;
-pub mod load;
-mod wrap;
-mod layer;
-
-use time::{Clock, DefaultClock};
+pub mod atomic;
 
 pub trait Cache<T: Value> {
     type Pointer: Deref<Target = T> + Clone;
@@ -186,69 +175,73 @@ pub trait Value {
     fn key(&self) -> &Self::Key;
 }
 
-#[test]
-fn test() {
-    use build::{BuildCache};
-    use std::{time::{Duration, Instant}, future::Future};
-    use load::{AsyncLoad, AsyncLoadCache};
+pub trait SharedPointer<T>: Deref<Target = T> + Clone { }
 
-    struct Test {
-        key: String,
-        expire: Instant,
-    }
+impl<P: Deref<Target = T> + Clone, T> SharedPointer<T> for P { }
 
-    impl Value for Test {
-        type Key = String;
+// #[test]
+// fn test() {
+//     use build::{BuildCache};
+//     use std::{time::{Duration, Instant}, future::Future};
+//     use load::{AsyncLoad, AsyncLoadCache};
 
-        fn key(&self) -> &Self::Key {
-            &self.key
-        }
-    }
+//     struct Test {
+//         key: String,
+//         expire: Instant,
+//     }
 
-    impl expire::ExpireAt for Test {
-        fn expire_at(&self) -> Instant {
-            self.expire
-        }
-    }
+//     impl Value for Test {
+//         type Key = String;
 
-    struct TestSource;
+//         fn key(&self) -> &Self::Key {
+//             &self.key
+//         }
+//     }
 
-    impl AsyncLoad<Test> for TestSource {
-        type Output = Test;
+//     impl expire::ExpireAt for Test {
+//         fn expire_at(&self) -> Instant {
+//             self.expire
+//         }
+//     }
 
-        fn load<K>(&self, key: &K) -> impl Future<Output = Self::Output> + Send
-        where
-            K: ?Sized + ToOwned<Owned = String>,
-        {
-            let key = key.to_owned();
-            async move {
-                Test {
-                    key,
-                    expire: Instant::now(),
-                }
-            }
-        }
-    }
+//     struct TestSource;
 
-    let cache = BuildCache::<Test>::default()
-        .expire_at()
-        .build_sync();
+//     impl AsyncLoad<Test> for TestSource {
+//         type Output = Test;
 
-    // let cache = sync::SyncCacheBuilder::new()
-    //     .evict(evict::EvictApproximate::with_window(
-    //         evict::touch::EvictLeastRecentlyTouched,
-    //         Duration::from_secs(1),
-    //     ))
-    //     .expire_at()
-    //     .build_load_dedup(TestSource);
+//         fn load<K>(&self, key: &K) -> impl Future<Output = Self::Output> + Send
+//         where
+//             K: ?Sized + ToOwned<Owned = String>,
+//         {
+//             let key = key.to_owned();
+//             async move {
+//                 Test {
+//                     key,
+//                     expire: Instant::now(),
+//                 }
+//             }
+//         }
+//     }
 
-    // async fn use_cache(cache: &impl AsyncLoadCache<Test>) {
-    //     cache.insert(Test {
-    //         key: "abc".into(),
-    //         expire: Instant::now(),
-    //     });
+//     let cache = BuildCache::<Test>::default()
+//         .expire_at()
+//         .build_sync();
 
-    //     let entry = cache.load("abc").await;
-    // }
-    // let _ = use_cache(&cache);
-}
+//     // let cache = sync::SyncCacheBuilder::new()
+//     //     .evict(evict::EvictApproximate::with_window(
+//     //         evict::touch::EvictLeastRecentlyTouched,
+//     //         Duration::from_secs(1),
+//     //     ))
+//     //     .expire_at()
+//     //     .build_load_dedup(TestSource);
+
+//     // async fn use_cache(cache: &impl AsyncLoadCache<Test>) {
+//     //     cache.insert(Test {
+//     //         key: "abc".into(),
+//     //         expire: Instant::now(),
+//     //     });
+
+//     //     let entry = cache.load("abc").await;
+//     // }
+//     // let _ = use_cache(&cache);
+// }
