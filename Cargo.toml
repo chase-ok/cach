@@ -1,7 +1,7 @@
 [package]
 name = "cach"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 crossbeam-utils = "0.8.20"
@@ -14,6 +14,7 @@ stable_deref_trait = "1.2.0"
 trait-variant = "0.1.2"
 futures = "0.3.31"
 slab = "0.4.9"
+arc-swap = "1.7.1"
 
 [features]
 default = ["rand"]

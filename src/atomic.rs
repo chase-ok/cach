@@ -2,6 +2,9 @@ use std::{borrow::Borrow, hash::Hash, ops::Deref};
 
 use crate::{Entry, SharedPointer, Value};
 
+mod sync;
+// mod scc;
+
 pub trait Cache<T: Value> {
     type Pointer: SharedPointer<T>;
 
@@ -9,37 +12,92 @@ pub trait Cache<T: Value> {
 
     fn iter(&self) -> impl Iterator<Item = Self::Pointer>;
 
+    // fn entry<'a, 'k, K>(
+    //     &'a self,
+    //     key: &'k K,
+    // ) -> Entry<
+    //     impl Occupied<Value = T, Pointer = Self::Pointer> + 'a,
+    //     impl Vacant<Value = T, Pointer = Self::Pointer> + 'a,
+    // >
+    // where
+    //     T::Key: Borrow<K>,
+    //     K: ?Sized + Hash + Eq;
+
+    fn compute<R>(
+        &self,
+        value: T,
+        f: impl FnMut(Option<T>, Option<&Self::Pointer>) -> Mutate<T, R>,
+    ) -> Compute<Self::Pointer, R>;
+
+    fn compute_key<K, R>(
+        &self,
+        key: &K,
+        f: impl FnMut(Option<T>, Option<&Self::Pointer>) -> Mutate<T, R>,
+    ) -> Compute<Self::Pointer, R>
+    where
+        T::Key: Borrow<K>,
+        K: ?Sized + Hash + Eq;
+
     fn get<K>(&self, key: &K) -> Option<Self::Pointer>
     where
         T::Key: Borrow<K>,
-        K: ?Sized + Hash + Eq;
-
-    fn try_put(
-        &self,
-        value: T,
-        expected: Option<&T>,
-    ) -> Result<Self::Pointer, (T, Option<Self::Pointer>)>;
-
-    fn try_remove<K>(&self, key: &K, expected: &T) -> Result<Self::Pointer, Option<Self::Pointer>>
-    where
-        T::Key: Borrow<K>,
-        K: ?Sized + Hash + Eq;
-
-    fn put(&self, mut value: T) -> Self::Pointer {
-        let mut expected = None;
-        loop {
-            match self.try_put(value, expected.as_ref().map(Deref::deref)) {
-                Ok(p) => return p,
-                Err((v, e)) => {
-                    value = v;
-                    expected = e;
-                }
-            }
+        K: ?Sized + Hash + Eq,
+    {
+        match self.compute_key(key, |_, current| Mutate::None(current.cloned())) {
+            Compute::None(p) => p,
+            _ => unreachable!(),
         }
     }
 
-    fn try_replace(&self, value: T, expected: &T) -> Result<Self::Pointer, T> {
-        self.try_put(value, Some(expected)).map_err(|(v, _e)| v)
+    fn insert(&self, value: T) -> Self::Pointer {
+        let Ok(pointer) = self.insert_if(value, |_, _| true) else {
+            unreachable!()
+        };
+        pointer
+    }
+
+    fn insert_if(
+        &self,
+        value: T,
+        mut f: impl FnMut(&T, Option<&T>) -> bool,
+    ) -> Result<Self::Pointer, (T, Option<Self::Pointer>)> {
+        let compute = self.compute(value, move |value, current| {
+            let value = value.unwrap();
+            if f(&value, current.map(|c| &**c)) {
+                Mutate::Insert(value)
+            } else {
+                Mutate::None((value, current.cloned()))
+            }
+        });
+
+        match compute {
+            Compute::None(r) => Err(r),
+            Compute::Inserted(p) => Ok(p),
+            Compute::Overwrote { after, .. } => Ok(after),
+            _ => unreachable!(),
+        }
+    }
+
+    fn remove_if<K: ?Sized>(
+        &self,
+        key: &K,
+        mut f: impl FnMut(&T) -> bool,
+    ) -> Result<Self::Pointer, Option<Self::Pointer>>
+    where
+        T::Key: Borrow<K>,
+        K: Hash + Eq,
+    {
+        let compute = self.compute_key(key, |_, current| {
+            match current {
+                Some(value) if f(value) => Mutate::Remove,
+                _ => Mutate::None(current.cloned())
+            }
+        });
+        match compute {
+            Compute::None(p) => Err(p),
+            Compute::Removed(p) => Ok(p),
+            _ => unreachable!()
+        }
     }
 
     fn remove<K>(&self, key: &K) -> Option<Self::Pointer>
@@ -47,32 +105,25 @@ pub trait Cache<T: Value> {
         T::Key: Borrow<K>,
         K: ?Sized + Hash + Eq,
     {
-        self.remove_if(key, |_| true)
-    }
-
-    fn remove_if<K: ?Sized>(&self, key: &K, mut f: impl FnMut(&T) -> bool) -> Option<Self::Pointer>
-    where
-        T::Key: Borrow<K>,
-        K: Hash + Eq,
-    {
-        let mut expected = self.get(key)?;
-        while f(&expected) {
-            match self.try_remove(key, &expected) {
-                Ok(p) => return Some(p),
-                Err(None) => return None,
-                Err(Some(e)) => expected = e,
-            }
+        match self.remove_if(key, |_| true) {
+            Ok(p) => Some(p),
+            Err(None) => None,
+            _ => unreachable!()
         }
-        None
     }
 
-    fn or_insert(&self, mut value: T) -> Self::Pointer {
-        loop {
-            match self.try_put(value, None) {
-                Ok(p) => return p,
-                Err((_v, Some(e))) => return e,
-                Err((v, None)) => value = v,
+    fn or_insert(&self, value: T) -> Self::Pointer {
+        let compute = self.compute(value, |value, current| {
+            if let Some(current) = current {
+                Mutate::None(current.clone())
+            } else {
+                Mutate::Insert(value.unwrap())
             }
+        });
+        match compute {
+            Compute::None(p) => p,
+            Compute::Inserted(p) => p,
+            _ => unreachable!()
         }
     }
 
@@ -81,9 +132,19 @@ pub trait Cache<T: Value> {
         T::Key: Borrow<K>,
         K: ?Sized + Hash + Eq,
     {
-        match self.get(key) {
-            Some(p) => p,
-            None => self.or_insert(f()),
+        let mut f = Some(f);
+        let compute = self.compute_key(key, |value, current| {
+            if let Some(current) = current {
+                Mutate::None(current.clone())
+            } else {
+                Mutate::Insert(value.unwrap_or_else(|| f.take().unwrap()()))
+            }
+        });
+
+        match compute {
+            Compute::None(p) => p,
+            Compute::Inserted(p) => p,
+            _ => unreachable!(),
         }
     }
 
@@ -95,38 +156,61 @@ pub trait Cache<T: Value> {
     {
         self.or_insert_with(key, Default::default)
     }
-
-    fn entry<'a, 'k, K>(
-        &'a self,
-        key: &'k K,
-    ) -> Entry<impl Occupied<Pointer = Self::Pointer> + 'a, impl Vacant<Pointer = Self::Pointer> + 'a>
-    where
-        T::Key: Borrow<K>,
-        K: ?Sized + Hash + Eq;
 }
 
-pub trait Occupied: Sized {
-    type Pointer: Deref;
-
-    fn value(&self) -> &<Self::Pointer as Deref>::Target;
-
-    fn pointer(&self) -> Self::Pointer;
-
-    fn into_pointer(self) -> Self::Pointer {
-        self.pointer()
-    }
-
-    // fn replace(self, value: <Self::Pointer as Deref>::Target) -> Self::Pointer
-    // where
-    //     <Self::Pointer as Deref>::Target: Sized;
-
-    // fn remove(self) -> Self::Pointer;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Mutate<T, R = ()> {
+    None(R),
+    Insert(T),
+    Remove,
 }
 
-pub trait Vacant {
-    type Pointer: Deref;
-
-    // fn insert(self, value: <Self::Pointer as Deref>::Target) -> Self::Pointer
-    // where
-    //     <Self::Pointer as Deref>::Target: Sized;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Compute<P, R = ()> {
+    None(R),
+    Inserted(P),
+    Overwrote { before: P, after: P },
+    Removed(P),
+    Err(ComputeError),
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ComputeError {
+    message: &'static str
+}
+
+// pub trait Occupied: Sized {
+//     type Value;
+//     type Pointer: Deref<Target = Self::Value>;
+
+//     fn value(&self) -> &Self::Value;
+
+//     fn pointer(&self) -> &Self::Pointer;
+
+//     fn into_pointer(self) -> Self::Pointer;
+
+//     fn try_replace(
+//         self,
+//         value: Self::Value,
+//     ) -> Result<
+//         Self::Pointer,
+//         (
+//             Self::Value,
+//             Entry<Self, impl Vacant<Value = Self::Value, Pointer = Self::Pointer>>,
+//         ),
+//     >;
+
+//     fn try_remove(
+//         self,
+//     ) -> Result<Self::Pointer, Entry<Self, impl Vacant<Value = Self::Value, Pointer = Self::Pointer>>>;
+// }
+
+// pub trait Vacant {
+//     type Value;
+//     type Pointer: Deref<Target = Self::Value>;
+
+//     fn try_insert(
+//         self,
+//         value: Self::Value,
+//     ) -> Result<Self::Pointer, (Self::Value, impl Occupied<Pointer = Self::Pointer>)>;
+// }
