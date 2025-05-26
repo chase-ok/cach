@@ -1,6 +1,6 @@
-use std::{borrow::Borrow, hash::Hash, ops::Deref};
+use std::{borrow::Borrow, hash::Hash, ops::Deref, time::Instant};
 
-use crate::{Entry, SharedPointer, Value};
+use crate::{SharedPointer, Value};
 
 mod sync;
 // mod scc;
@@ -178,6 +178,118 @@ pub enum Compute<P, R = ()> {
 pub struct ComputeError {
     message: &'static str
 }
+
+pub trait Builder {
+    type Cache<T: Value>: Cache<T>;
+
+    fn build<T: Value>(self) -> Self::Cache<T>;
+}
+
+pub trait Layer {
+    type Builder<B: Builder>: Builder;
+
+    fn apply<B: Builder>(self, builder: B) -> Self::Builder<B>;
+}
+
+struct ExpireAfterWrite {
+
+}
+
+impl Layer for ExpireAfterWrite {
+    type Builder<B: Builder> = ExpireAfterWriteBuilder<B>;
+
+    fn apply<B: Builder>(self, builder: B) -> Self::Builder<B> {
+        ExpireAfterWriteBuilder(builder)
+    }
+}
+
+struct ExpireAfterWriteBuilder<B>(B);
+
+impl<B: Builder> Builder for ExpireAfterWriteBuilder<B> {
+    type Cache<T: Value> = ExpireAfterWriteCache<B::Cache<ExpireAfterWriteValue<T>>>;
+
+    fn build<T: Value>(self) -> Self::Cache<T> {
+        ExpireAfterWriteCache(self.0.build())
+    }
+}
+
+struct ExpireAfterWriteCache<C>(C);
+
+struct ExpireAfterWriteValue<T> {
+    value: T,
+    expire: Instant,
+}
+
+impl<T: Value> Value for ExpireAfterWriteValue<T> {
+    type Key = T::Key;
+
+    fn key(&self) -> &Self::Key {
+        todo!()
+    }
+}
+
+impl<C: Cache<ExpireAfterWriteValue<T>>, T: Value> Cache<T> for ExpireAfterWriteCache<C> {
+    type Pointer = ExpireAfterWritePointer<C::Pointer>;
+
+    fn len(&self) -> usize {
+        todo!()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Self::Pointer> {
+        self.0.iter().map(ExpireAfterWritePointer)
+    }
+
+    fn compute<R>(
+        &self,
+        value: T,
+        mut f: impl FnMut(Option<T>, Option<&Self::Pointer>) -> Mutate<T, R>,
+    ) -> Compute<Self::Pointer, R> {
+        let now = Instant::now();
+        let value = ExpireAfterWriteValue { value, expire: now };
+        let compute = self.0.compute(value, move |value, current| {
+            match current {
+                Some(current) if current.expire > Instant::now() => {
+                    match f(value.map(|v| v.value), None) {
+                        Mutate::None(r) => Mutate::Remove, // XX need to store r!
+                        Mutate::Insert(value) => Mutate::Insert(ExpireAfterWriteValue { value, expire: now }),
+                        Mutate::Remove => Mutate::Remove,
+                    }
+                },
+                Some(current) => todo!(),
+                None => match f(value.map(|v| v.value), None) {
+                    Mutate::None(r) => Mutate::None(r),
+                    Mutate::Insert(value) => Mutate::Insert(ExpireAfterWriteValue { value, expire: now }),
+                    Mutate::Remove => Mutate::Remove,
+                }
+            }
+        });
+        todo!()
+    }
+
+    fn compute_key<K, R>(
+        &self,
+        key: &K,
+        f: impl FnMut(Option<T>, Option<&Self::Pointer>) -> Mutate<T, R>,
+    ) -> Compute<Self::Pointer, R>
+    where
+        <T as Value>::Key: Borrow<K>,
+        K: ?Sized + Hash + Eq {
+        todo!()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[repr(transparent)]
+struct ExpireAfterWritePointer<P>(P);
+
+impl<P: Deref<Target = ExpireAfterWriteValue<T>>, T> Deref for ExpireAfterWritePointer<P> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.value
+    }
+}
+
 
 // pub trait Occupied: Sized {
 //     type Value;

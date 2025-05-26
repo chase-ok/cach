@@ -1,6 +1,8 @@
 use std::{
     borrow::Borrow,
+    cmp::Eq,
     hash::{BuildHasher, Hash},
+    iter::FusedIterator,
     ops::Deref,
     ptr,
     sync::Arc,
@@ -8,25 +10,49 @@ use std::{
 
 use arc_swap::{ArcSwap, ArcSwapAny, AsRaw, Guard};
 use crossbeam_utils::CachePadded;
-use hashbrown::{hash_map::DefaultHashBuilder, raw::RawTable};
+use hashbrown::{hash_table, DefaultHashBuilder, HashTable};
 use parking_lot::RwLock;
+use ref_cast::RefCast;
 use stable_deref_trait::{CloneStableDeref, StableDeref};
 
 use crate::atomic::ComputeError;
 
 use super::{Compute, Mutate};
 
+pub struct Builder<S = DefaultHashBuilder> {
+    hash_builder: S,
+}
+
+impl<S: BuildHasher> super::Builder for Builder<S> {
+    type Cache<T: crate::Value> = Cache<T, S>;
+
+    fn build<T: crate::Value>(self) -> Self::Cache<T> {
+        Cache {
+            shards: (0..16)
+                .map(|_| {
+                    CachePadded::new(RwLock::new(Shard {
+                        values: HashTable::with_capacity(16),
+                    }))
+                })
+                .collect(),
+            hash_builder: self.hash_builder,
+            mask: 16 - 1,
+        }
+    }
+}
+
 pub struct Cache<T, S = DefaultHashBuilder> {
     shards: Vec<CachePadded<RwLock<Shard<T>>>>,
     hash_builder: S,
     mask: usize,
-    capacity_per_shard: usize,
 }
 
 struct Shard<T> {
-    values: RawTable<ArcSwap<T>>,
+    values: HashTable<ArcSwap<T>>,
 }
 
+#[derive(RefCast)]
+#[repr(transparent)]
 pub struct Pointer<T>(Arc<T>);
 
 impl<T> Clone for Pointer<T> {
@@ -49,11 +75,10 @@ unsafe impl<T> CloneStableDeref for Pointer<T> {}
 
 impl<T, S> super::Cache<T> for Cache<T, S>
 where
-    T: crate::Value + 'static,
-    T::Key: Hash + std::cmp::Eq,
+    T: crate::Value,
     S: BuildHasher,
 {
-    type Pointer = Arc<T>;
+    type Pointer = Pointer<T>;
 
     fn len(&self) -> usize {
         self.shards
@@ -83,66 +108,41 @@ where
     }
 
     fn iter(&self) -> impl Iterator<Item = Self::Pointer> {
-        todo!();
-        [].into_iter()
-        // self.shards.iter().flat_map(|shard| {
-        //     let mut pointers = Vec::new();
-        //     loop {
-        //         pointers.clear();
+        struct Iter<S, T> {
+            shards: S,
+            pointers: Vec<Arc<T>>,
+        }
 
-        //         // XX
-        //         let buckets_len = {
-        //             let shard = shard.read();
-        //             pointers.reserve(shard.values.len());
-        //             shard.values.buckets()
-        //         };
+        impl<'a, S, T: 'a> Iterator for Iter<S, T>
+        where
+            S: Iterator<Item = &'a RwLock<Shard<T>>>,
+        {
+            type Item = Pointer<T>;
 
-        //         const CHUNK: usize = 256;
-        //         let mut i = 0;
-        //         while i < buckets_len {
-        //             match Ls::ITER_READ_LOCK {
-        //                 layer::ReadLock::None => {
-        //                     let shard = shard.read();
-        //                     for bucket in i..buckets_len.min(i + CHUNK) {
-        //                         // XX safety
-        //                         if unsafe { shard.values.is_bucket_full(bucket) } {
-        //                             // XX safety
-        //                             let bucket = unsafe { shard.values.bucket(bucket) };
-        //                             // XX safety
-        //                             let pointer = unsafe { bucket.as_ref() }.clone();
-        //                             pointers.push(pointer);
-        //                         }
-        //                     }
-        //                 }
-        //                 layer::ReadLock::Ref | layer::ReadLock::Mut => {
-        //                     let mut shard = shard.write(); // don't try to upgrade later to a write lock on ::Remove
-        //                     for bucket in i..buckets_len.min(i + CHUNK) {
-        //                         // XX safety
-        //                         if unsafe { shard.values.is_bucket_full(bucket) } {
-        //                             // XX safety
-        //                             let bucket = unsafe { shard.values.bucket(bucket) };
-        //                             // XX safety
-        //                             let pointer = unsafe { bucket.as_ref() };
-        //                             match shard.layer.iter_read_mut::<ResolveLayer>(pointer) {
-        //                                 ReadResult::Retain => pointers.push(pointer.clone()),
-        //                                 ReadResult::Remove => {
-        //                                     shard.layer.remove::<ResolveLayer>(pointer);
-        //                                     unsafe {
-        //                                         shard.values.remove(bucket);
-        //                                     }
-        //                                 }
-        //                             }
-        //                         }
-        //                     }
-        //                 }
-        //             }
+            fn next(&mut self) -> Option<Self::Item> {
+                while self.pointers.is_empty() {
+                    if let Some(shard) = self.shards.next() {
+                        let shard = shard.read();
+                        self.pointers.extend(shard.values.iter().map(ArcSwap::load_full));
+                    } else {
+                        break;
+                    }
+                }
 
-        //             i += CHUNK
-        //         }
-        //         break;
-        //     }
-        //     pointers
-        // })
+                self.pointers.pop().map(Pointer)
+            }
+        }
+
+        impl<'a, S, T: 'a> FusedIterator for Iter<S, T> where
+            S: Iterator<Item = &'a RwLock<Shard<T>>> + FusedIterator
+        {
+        }
+
+        // XX could use smaller chunks for consistent performance
+        Iter {
+            shards: self.shards.iter().map(|s| &**s),
+            pointers: Vec::new(),
+        }
     }
 
     fn insert(&self, value: T) -> Self::Pointer {
@@ -153,29 +153,22 @@ where
         if let Some(swap) = self.shards[shard]
             .read()
             .values
-            .get(hash, |s| s.load().key() == key)
+            .find(hash, |s| s.load().key() == key)
         {
             swap.store(value.clone());
         } else {
             let mut shard = self.shards[shard].write();
-            match shard.values.find_or_find_insert_slot(
-                hash,
-                |s| s.load().key() == key,
-                |s| self.hash_builder.hash_one(s.load().key()),
-            ) {
-                Ok(bucket) => {
-                    let swap = unsafe { bucket.as_ref() };
-                    swap.store(value.clone());
+            match shard.values.entry(hash, |s| s.load().key() == key, |s| self.hash_builder.hash_one(s.load().key())) {
+                hash_table::Entry::Occupied(occupied) => {
+                    occupied.get().store(value.clone());
                 }
-                Err(slot) => unsafe {
-                    shard
-                        .values
-                        .insert_in_slot(hash, slot, ArcSwapAny::from(value.clone()));
-                },
+                hash_table::Entry::Vacant(vacant) => {
+                    vacant.insert(ArcSwapAny::from(value.clone()));
+                }
             }
         }
 
-        value
+        Pointer(value)
     }
 
     fn remove_if<K: ?Sized>(
@@ -189,20 +182,17 @@ where
     {
         let (hash, shard) = self.hash_and_shard(key);
         let mut shard = self.shards[shard].write();
-        match shard.values.find(hash, |s| s.load().key().borrow() == key) {
-            Some(bucket) => {
-                let swap = unsafe { bucket.as_ref() };
-                let current = swap.load();
-                if f(&current) {
-                    unsafe {
-                        shard.values.remove(bucket);
-                    }
-                    Ok(Guard::into_inner(current))
+        match shard.values.find_entry(hash, |s| s.load().key().borrow() == key) {
+            Ok(occupied) => {
+                let value = occupied.get().load_full();
+                if f(&value) {
+                    occupied.remove();
+                    Ok(Pointer(value))
                 } else {
-                    Err(Some(Guard::into_inner(current)))
+                    Err(Some(Pointer(value)))
                 }
-            }
-            None => Err(None),
+            },
+            Err(_) => Err(None),
         }
     }
 }
@@ -213,11 +203,12 @@ enum ComputeKind<'a, T, K: ?Sized> {
 }
 
 impl<T: crate::Value, S: BuildHasher> Cache<T, S> {
+    #[inline]
     fn do_compute<K, R>(
         &self,
         kind: ComputeKind<'_, T, K>,
-        mut f: impl FnMut(Option<T>, Option<&Arc<T>>) -> Mutate<T, R>,
-    ) -> Compute<Arc<T>, R>
+        mut f: impl FnMut(Option<T>, Option<&Pointer<T>>) -> Mutate<T, R>,
+    ) -> Compute<Pointer<T>, R>
     where
         T::Key: Borrow<K>,
         K: ?Sized + Hash + Eq,
@@ -230,7 +221,7 @@ impl<T: crate::Value, S: BuildHasher> Cache<T, S> {
 
         let (mutate, expected) = {
             let shard = self.shards[shard].read();
-            let swap = shard.values.get(hash, |s| s.load().key().borrow() == key);
+            let swap = shard.values.find(hash, |s| s.load().key().borrow() == key);
             let mut value = match kind {
                 ComputeKind::ByValue(v) => Some(v),
                 ComputeKind::ByKey(_) => None,
@@ -239,15 +230,15 @@ impl<T: crate::Value, S: BuildHasher> Cache<T, S> {
             if let Some(swap) = swap {
                 let mut current = swap.load();
                 loop {
-                    match f(value.take(), Some(&current)) {
+                    match f(value.take(), Some(Pointer::ref_cast(&current))) {
                         Mutate::None(r) => return Compute::None(r),
                         Mutate::Insert(new) => {
                             let new = Arc::new(new);
                             let prev = swap.compare_and_swap(&current, new.clone());
                             if ptr::eq(current.as_raw(), prev.as_raw()) {
                                 return Compute::Overwrote {
-                                    before: Guard::into_inner(current),
-                                    after: new,
+                                    before: Pointer(Guard::into_inner(current)),
+                                    after: Pointer(new),
                                 };
                             } else {
                                 value = Some(Arc::into_inner(new).unwrap());
@@ -279,20 +270,19 @@ impl<T: crate::Value, S: BuildHasher> Cache<T, S> {
             _ => unreachable!(),
         };
 
-        match shard.values.find_or_find_insert_slot(
+        match shard.values.entry(
             hash,
             |s| s.load().key() == key,
             |s| self.hash_builder.hash_one(s.load().key()),
         ) {
-            Ok(bucket) => {
+            hash_table::Entry::Occupied(occupied) => {
                 // XX safety
-                let swap = unsafe { bucket.as_ref() };
-                let current = swap.load();
+                let current = occupied.get().load();
 
                 let mutate = match (expected, mutate) {
                     (Some(expected), m) if Arc::ptr_eq(&current, &expected) => m,
-                    (_, Mutate::Insert(v)) => f(Some(v), Some(&current)),
-                    (_, Mutate::Remove) => f(None, Some(&current)),
+                    (_, Mutate::Insert(v)) => f(Some(v), Some(Pointer::ref_cast(&current))),
+                    (_, Mutate::Remove) => f(None, Some(Pointer::ref_cast(&current))),
                     _ => unreachable!(),
                 };
 
@@ -300,23 +290,19 @@ impl<T: crate::Value, S: BuildHasher> Cache<T, S> {
                     Mutate::None(r) => Compute::None(r),
                     Mutate::Insert(new) => {
                         let new = Arc::new(new);
-                        swap.store(new.clone());
+                        occupied.get().store(new.clone());
                         Compute::Overwrote {
-                            before: Guard::into_inner(current),
-                            after: new,
+                            before: Pointer(Guard::into_inner(current)),
+                            after: Pointer(new),
                         }
                     }
                     Mutate::Remove => {
-                        // XX Safety
-                        unsafe {
-                            shard.values.remove(bucket);
-                        }
-                        Compute::Removed(Guard::into_inner(current))
+                        occupied.remove();
+                        Compute::Removed(Pointer(Guard::into_inner(current)))
                     }
                 }
             }
-
-            Err(slot) => {
+            hash_table::Entry::Vacant(vacant) => {
                 let mutate = match (expected, mutate) {
                     (None, m) => m,
                     (_, Mutate::Insert(v)) => f(Some(v), None),
@@ -328,11 +314,8 @@ impl<T: crate::Value, S: BuildHasher> Cache<T, S> {
                     Mutate::None(r) => Compute::None(r),
                     Mutate::Insert(new) => {
                         let new = Arc::new(new);
-                        let swap = ArcSwapAny::from(new.clone());
-                        unsafe {
-                            shard.values.insert_in_slot(hash, slot, swap);
-                        }
-                        Compute::Inserted(new)
+                        vacant.insert(new.clone().into());
+                        Compute::Inserted(Pointer(new))
                     }
                     Mutate::Remove => Compute::Err(ComputeError {
                         message: "removed non-existent value",

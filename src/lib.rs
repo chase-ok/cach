@@ -5,6 +5,9 @@ use std::{
 };
 
 pub mod atomic;
+pub mod sharded;
+
+pub mod store;
 
 pub trait Cache<T: Value> {
     type Pointer: Deref<Target = T> + Clone;
@@ -23,7 +26,7 @@ pub trait Cache<T: Value> {
     where
         T::Key: Borrow<K>,
         K: ?Sized + Hash + Eq;
-    
+
     fn try_entry<'c, 'k, K>(
         &'c self,
         key: &'k K,
@@ -169,7 +172,7 @@ impl<O: OccupiedEntry, V: VacantEntry<Pointer = O::Pointer>> Entry<O, V> {
     }
 }
 
-pub trait Value {
+pub trait Value: 'static {
     type Key: ?Sized + Hash + Eq;
 
     fn key(&self) -> &Self::Key;
