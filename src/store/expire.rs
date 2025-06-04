@@ -1,8 +1,7 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    Pointer,
-    layer::{BuildLayer, Layer, LayerDeref, ReadExclusive, ReadShared},
+    strategy::{BuildStrategy, Strategy, StrategyPointer, Lock, ReadExclusive, ReadShared}, Pointer
 };
 
 pub trait Expire<P: Pointer> {
@@ -15,13 +14,17 @@ pub trait Expire<P: Pointer> {
 
 pub struct ExpireLayer<E>(E);
 
-impl<P, D, E> Layer<P, D> for ExpireLayer<E>
+impl<P, E> Strategy<P> for ExpireLayer<E>
 where
-    P: Pointer,
-    D: LayerDeref<P, E::Value>,
+    P: StrategyPointer<StrategyValue = E::Value>,
     E: Expire<P>,
 {
     type Value = E::Value;
+
+    const READ_LOCK: Lock = Lock::Shared;
+    const REMOVE_LOCK: Lock = Lock::Shared;
+    const INSERT_LOCK: Lock = Lock::Shared;
+    const PURGE_LOCK: Lock = Lock::Shared;
 
     fn create_insert_shared_value(&self, target: &P::Target) -> Self::Value {
         self.0.insert(target)
@@ -33,7 +36,7 @@ where
 
     #[inline]
     fn read_shared(&self, pointer: &P) -> ReadShared {
-        if self.0.is_expired(pointer, D::deref(pointer)) {
+        if self.0.is_expired(pointer, pointer.strategy_value()) {
             ReadShared::Remove
         } else {
             ReadShared::Allow
@@ -41,7 +44,7 @@ where
     }
 
     fn read(&mut self, pointer: &P) -> ReadExclusive {
-        if self.0.is_expired(pointer, D::deref(pointer)) {
+        if self.0.is_expired(pointer, pointer.strategy_value()) {
             ReadExclusive::Remove
         } else {
             ReadExclusive::Allow
@@ -49,7 +52,7 @@ where
     }
 }
 
-pub trait Now {
+pub trait Now: Clone {
     fn now(&self) -> Instant;
 }
 
@@ -68,6 +71,15 @@ pub struct ExpireAfterWrite<N = SystemInstant> {
     duration: Duration,
 }
 
+impl ExpireAfterWrite {
+    pub fn new(duration: Duration) -> Self {
+        Self {
+            now: SystemInstant,
+            duration,
+        }
+    }
+}
+
 impl<P: Pointer, N: Now> Expire<P> for ExpireAfterWrite<N> {
     type Value = Instant;
 
@@ -80,20 +92,65 @@ impl<P: Pointer, N: Now> Expire<P> for ExpireAfterWrite<N> {
     }
 }
 
-impl<T, N: Now> BuildLayer<T> for ExpireAfterWrite<N> {
+impl<T, N: Now> BuildStrategy<T> for ExpireAfterWrite<N> {
     type Value = Instant;
 
-    type Layer<P, D>
+    type Strategy<P>
         = ExpireLayer<Self>
     where
-        P: Pointer<Target = T>,
-        D: LayerDeref<P, Self::Value>;
+        P: StrategyPointer<Target = T, StrategyValue = Self::Value>;
 
-    fn build<P, D>(self) -> Self::Layer<P, D>
+
+    fn build_sharded<P>(self, shards: usize) -> impl Iterator<Item = Self::Strategy<P>>
     where
-        P: Pointer<Target = T>,
-        D: LayerDeref<P, Self::Value>,
-    {
-        ExpireLayer(self)
+        P: StrategyPointer<Target = T, StrategyValue = Self::Value> {
+        std::iter::repeat_with(move || ExpireLayer(self.clone())).take(shards)
     }
 }
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ExpireAtIntrusive<N = SystemInstant> {
+    now: N,
+}
+
+impl ExpireAtIntrusive {
+    pub const fn new() -> Self {
+        Self { now: SystemInstant }
+    }
+}
+
+pub trait ExpireAt {
+    fn expire_at(&self) -> Instant;
+}
+
+impl<P: Pointer, N: Now> Expire<P> for ExpireAtIntrusive<N>
+where
+    P::Target: ExpireAt,
+{
+    type Value = ();
+
+    fn insert(&self, _target: &P::Target) -> Self::Value {
+        ()
+    }
+
+    fn is_expired(&self, pointer: &P, _value: &()) -> bool {
+        self.now.now() >= pointer.expire_at()
+    }
+}
+
+impl<T: ExpireAt, N: Now> BuildStrategy<T> for ExpireAtIntrusive<N> {
+    type Value = ();
+
+    type Strategy<P>
+        = ExpireLayer<Self>
+    where
+        P: StrategyPointer<Target = T, StrategyValue = Self::Value>;
+
+
+    fn build_sharded<P>(self, shards: usize) -> impl Iterator<Item = Self::Strategy<P>>
+    where
+        P: StrategyPointer<Target = T, StrategyValue = Self::Value> {
+        std::iter::repeat_with(move || ExpireLayer(self.clone())).take(shards)
+    }
+}
+

@@ -10,7 +10,7 @@ use std::{
 
 use arc_swap::{ArcSwap, ArcSwapAny, AsRaw, Guard};
 use crossbeam_utils::CachePadded;
-use hashbrown::{hash_table, DefaultHashBuilder, HashTable};
+use hashbrown::{DefaultHashBuilder, HashTable, hash_table};
 use parking_lot::RwLock;
 use ref_cast::RefCast;
 use stable_deref_trait::{CloneStableDeref, StableDeref};
@@ -123,7 +123,8 @@ where
                 while self.pointers.is_empty() {
                     if let Some(shard) = self.shards.next() {
                         let shard = shard.read();
-                        self.pointers.extend(shard.values.iter().map(ArcSwap::load_full));
+                        self.pointers
+                            .extend(shard.values.iter().map(ArcSwap::load_full));
                     } else {
                         break;
                     }
@@ -158,7 +159,11 @@ where
             swap.store(value.clone());
         } else {
             let mut shard = self.shards[shard].write();
-            match shard.values.entry(hash, |s| s.load().key() == key, |s| self.hash_builder.hash_one(s.load().key())) {
+            match shard.values.entry(
+                hash,
+                |s| s.load().key() == key,
+                |s| self.hash_builder.hash_one(s.load().key()),
+            ) {
                 hash_table::Entry::Occupied(occupied) => {
                     occupied.get().store(value.clone());
                 }
@@ -182,7 +187,10 @@ where
     {
         let (hash, shard) = self.hash_and_shard(key);
         let mut shard = self.shards[shard].write();
-        match shard.values.find_entry(hash, |s| s.load().key().borrow() == key) {
+        match shard
+            .values
+            .find_entry(hash, |s| s.load().key().borrow() == key)
+        {
             Ok(occupied) => {
                 let value = occupied.get().load_full();
                 if f(&value) {
@@ -191,7 +199,7 @@ where
                 } else {
                     Err(Some(Pointer(value)))
                 }
-            },
+            }
             Err(_) => Err(None),
         }
     }

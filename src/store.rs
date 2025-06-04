@@ -1,15 +1,16 @@
 use equivalent::{Comparable, Equivalent};
-use layer::{BuildLayer, Layer, NoneLayer};
-use map::{HashEntry, HashMap};
+use strategy::{BuildStrategy, NoStrategy};
 use std::array;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::{Bound, Deref, RangeBounds};
 
 pub mod map;
-pub mod layer;
+pub mod strategy;
 pub mod atomic;
 pub mod expire;
+
+pub mod hash;
 
 pub trait Pointer: Deref + Clone {}
 
@@ -52,81 +53,30 @@ pub trait Store<T> {
     fn or_insert(&self, value: T) -> Self::Pointer;
 
     fn remove(&self, value: &T) -> Option<Self::Pointer>;
+
+    fn upsert(&self, value: T, f: impl FnOnce(T, &Self::Pointer) -> Option<T>) -> Self::Pointer;
 }
 
 pub trait BuildStore {
-    type Store<T: 'static + HashValue, L>: Store<T>
+    type Store<T: 'static + hash::Value + Send + Sync, S>: Store<T>
     where
-        L: BuildLayer<T>;
+        S: BuildStrategy<T>;
 
-    fn build_store<T: 'static + HashValue>(self) -> Self::Store<T, NoneLayer>
+    fn build_store<T: 'static + hash::Value + Send + Sync>(self) -> Self::Store<T, NoStrategy>
     where
         Self: Sized
     {
-        self.build_store_with_layer(NoneLayer)
+        self.build_store_with_strategy(NoStrategy)
     }
 
-    fn build_store_with_layer<T: 'static + HashValue, L: BuildLayer<T>>(self, layer: L) -> Self::Store<T, L>;
+    fn build_store_with_strategy<T: 'static + hash::Value + Send + Sync, S: BuildStrategy<T>>(self, layer: S) -> Self::Store<T, S>;
 }
 
-pub trait HashStore<T: HashValue>: Store<T> {
-    #[inline]
-    fn keys(&self) -> impl Iterator<Item = impl Pointer<Target = T::Key>> {
-        #[derive(Clone, Copy)]
-        struct ExtractKey<P>(P);
 
-        impl<P: Deref> Deref for ExtractKey<P>
-        where
-            P::Target: HashValue,
-        {
-            type Target = <P::Target as HashValue>::Key;
-
-            fn deref(&self) -> &Self::Target {
-                self.0.key()
-            }
-        }
-
-        self.iter().map(ExtractKey)
-    }
-
-    fn get<K>(&self, key: &K) -> Option<Self::Pointer>
-    where
-        K: ?Sized + Hash + Equivalent<T::Key>;
-
-    #[inline]
-    fn get_many<K, const N: usize>(&self, keys: [&K; N]) -> [Option<Self::Pointer>; N]
-    where
-        K: ?Sized + Hash + Equivalent<T::Key>,
-    {
-        array::from_fn(|i| self.get(keys[i]))
-    }
-
-    fn or_insert_with<K>(&self, key: K, value: impl FnOnce(K) -> T) -> Self::Pointer
-    where
-        K: Hash + Equivalent<T::Key>;
-
-    fn remove_key<K>(&self, key: &K) -> Option<Self::Pointer>
-    where
-        K: ?Sized + Hash + Equivalent<T::Key>;
-}
-
-pub trait HashValue {
-    type Key: ?Sized + Eq + Hash;
-
-    fn key(&self) -> &Self::Key;
-}
-
-pub trait BuildHashStore {
-    type HashStore<T: HashValue>: HashStore<T>;
-
-    fn build_hash_store<T: HashValue>(self) -> Self::HashStore<T>;
-
-    fn build_hash_map<K: Hash + Eq, V>(self) -> HashMap<Self::HashStore<HashEntry<K, V>>, K, V>
-    where
-        Self: Sized,
-    {
-        HashMap::new(self.build_hash_store())
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Entry<O, V> {
+    Occupied(O),
+    Vacant(V)
 }
 
 pub trait HashOrdStore<T: HashOrdValue>: Store<T> {
@@ -284,9 +234,9 @@ pub trait HashOrdStore<T: HashOrdValue>: Store<T> {
         O: ?Sized + Comparable<T::Ord>;
 }
 
-pub trait HashOrdValue: HashValue + OrdValue {}
+pub trait HashOrdValue: hash::Value + OrdValue {}
 
-impl<V: HashValue + OrdValue + ?Sized> HashOrdValue for V {}
+impl<V: hash::Value + OrdValue + ?Sized> HashOrdValue for V {}
 
 pub trait OrdStore<T: OrdValue>: Store<T> {
     fn get<O>(&self, ord: &O) -> Option<Self::Pointer>
@@ -423,4 +373,36 @@ pub trait OrdValue {
     type Ord: ?Sized + Ord;
 
     fn ord(&self) -> &Self::Ord;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{expire::{ExpireAfterWrite, ExpireAt, ExpireAtIntrusive}, BuildStore, hash::Value, Store};
+
+    struct TestValue {
+        x: u64,
+        expire_at: Instant,
+    }
+
+    impl Value for TestValue {
+        type Key = u64;
+
+        fn key(&self) -> &Self::Key {
+            &self.x
+        }
+    }
+
+    impl ExpireAt for TestValue {
+        fn expire_at(&self) -> Instant {
+            self.expire_at
+        }
+    }
+
+    fn compiles(x: impl BuildStore) {
+        let store = x.build_store_with_strategy::<TestValue, _>(ExpireAtIntrusive::new());
+        let p = store.insert(TestValue { x: 1, expire_at: Instant::now() });
+        p.x;
+    }
 }
