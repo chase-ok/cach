@@ -1,10 +1,11 @@
 use super::{Entry, Pointer};
 use equivalent::Equivalent;
+use stable_deref_trait::StableDeref;
 use std::{hash::Hash, ops::Deref};
 
 pub trait Store<T: Value>: super::Store<T> {
     #[inline]
-    fn keys(&self) -> impl Iterator<Item = impl Pointer<Target = T::Key>> {
+    fn keys(&self) -> impl Iterator<Item = impl Deref<Target = T::Key>> {
         self.iter().map(ExtractKey)
     }
 
@@ -152,7 +153,6 @@ where
         self.0.key()
     }
 }
-
 
 #[inline]
 pub(crate) fn impl_insert<T, S>(store: &S, value: T) -> S::Pointer

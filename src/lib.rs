@@ -9,6 +9,8 @@ pub mod sharded;
 
 pub mod store;
 
+pub(crate) mod lock;
+
 pub trait Cache<T: Value> {
     type Pointer: Deref<Target = T> + Clone;
 

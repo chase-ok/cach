@@ -1,4 +1,5 @@
 use equivalent::{Comparable, Equivalent};
+use stable_deref_trait::CloneStableDeref;
 use strategy::{BuildStrategy, NoStrategy};
 use std::array;
 use std::hash::Hash;
@@ -12,9 +13,9 @@ pub mod expire;
 
 pub mod hash;
 
-pub trait Pointer: Deref + Clone {}
+pub trait Pointer: Deref + Clone + CloneStableDeref {}
 
-impl<P: Deref + Clone> Pointer for P {}
+impl<P: Deref + Clone + CloneStableDeref> Pointer for P {}
 
 pub trait Store<T> {
     type Pointer: Pointer<Target = T>;

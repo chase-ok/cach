@@ -1,7 +1,11 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{Duration, Instant},
+};
 
 use super::{
-    strategy::{BuildStrategy, Strategy, StrategyPointer, Lock, ReadExclusive, ReadShared}, Pointer
+    Pointer,
+    strategy::{BuildStrategy, Lock, ReadExclusive, ReadShared, Strategy, StrategyPointer},
 };
 
 pub trait Expire<P: Pointer> {
@@ -9,15 +13,17 @@ pub trait Expire<P: Pointer> {
 
     fn insert(&self, target: &P::Target) -> Self::Value;
 
-    fn is_expired(&self, pointer: &P, value: &Self::Value) -> bool;
+    // XX must be const
+    fn expires_at(&self, pointer: &P, value: &Self::Value) -> Instant;
 }
 
-pub struct ExpireLayer<E>(E);
+pub struct ExpireLayer<E, N = SystemInstant>(E, N);
 
-impl<P, E> Strategy<P> for ExpireLayer<E>
+impl<P, E, N> Strategy<P> for ExpireLayer<E, N>
 where
     P: StrategyPointer<StrategyValue = E::Value>,
     E: Expire<P>,
+    N: Now,
 {
     type Value = E::Value;
 
@@ -36,7 +42,7 @@ where
 
     #[inline]
     fn read_shared(&self, pointer: &P) -> ReadShared {
-        if self.0.is_expired(pointer, pointer.strategy_value()) {
+        if self.1.now() >= self.0.expires_at(pointer, pointer.strategy_value()) {
             ReadShared::Remove
         } else {
             ReadShared::Allow
@@ -44,7 +50,7 @@ where
     }
 
     fn read(&mut self, pointer: &P) -> ReadExclusive {
-        if self.0.is_expired(pointer, pointer.strategy_value()) {
+        if self.1.now() >= self.0.expires_at(pointer, pointer.strategy_value()) {
             ReadExclusive::Remove
         } else {
             ReadExclusive::Allow
@@ -87,8 +93,8 @@ impl<P: Pointer, N: Now> Expire<P> for ExpireAfterWrite<N> {
         self.now.now() + self.duration
     }
 
-    fn is_expired(&self, _pointer: &P, value: &Self::Value) -> bool {
-        self.now.now() >= *value
+    fn expires_at(&self, _pointer: &P, value: &Self::Value) -> Instant {
+        *value
     }
 }
 
@@ -96,15 +102,15 @@ impl<T, N: Now> BuildStrategy<T> for ExpireAfterWrite<N> {
     type Value = Instant;
 
     type Strategy<P>
-        = ExpireLayer<Self>
+        = ExpireLayer<Self, N>
     where
         P: StrategyPointer<Target = T, StrategyValue = Self::Value>;
 
-
     fn build_sharded<P>(self, shards: usize) -> impl Iterator<Item = Self::Strategy<P>>
     where
-        P: StrategyPointer<Target = T, StrategyValue = Self::Value> {
-        std::iter::repeat_with(move || ExpireLayer(self.clone())).take(shards)
+        P: StrategyPointer<Target = T, StrategyValue = Self::Value>,
+    {
+        std::iter::repeat_with(move || ExpireLayer(self.clone(), self.now.clone())).take(shards)
     }
 }
 
@@ -133,8 +139,9 @@ where
         ()
     }
 
-    fn is_expired(&self, pointer: &P, _value: &()) -> bool {
-        self.now.now() >= pointer.expire_at()
+    fn expires_at(&self, pointer: &P, _value: &Self::Value) -> Instant {
+        // XX make const?
+        pointer.expire_at()
     }
 }
 
@@ -142,15 +149,69 @@ impl<T: ExpireAt, N: Now> BuildStrategy<T> for ExpireAtIntrusive<N> {
     type Value = ();
 
     type Strategy<P>
-        = ExpireLayer<Self>
+        = ExpireLayer<Self, N>
     where
         P: StrategyPointer<Target = T, StrategyValue = Self::Value>;
 
-
     fn build_sharded<P>(self, shards: usize) -> impl Iterator<Item = Self::Strategy<P>>
     where
-        P: StrategyPointer<Target = T, StrategyValue = Self::Value> {
-        std::iter::repeat_with(move || ExpireLayer(self.clone())).take(shards)
+        P: StrategyPointer<Target = T, StrategyValue = Self::Value>,
+    {
+        std::iter::repeat_with(move || ExpireLayer(self.clone(), self.now.clone())).take(shards)
     }
 }
 
+pub struct ExpireFrozenLayer<P, N = SystemInstant> {
+    now: N,
+    sorted: BTreeMap<Instant, P>,
+}
+
+impl<P, N> Strategy<P> for ExpireFrozenLayer<P, N>
+where
+    P: StrategyPointer<StrategyValue = Instant>,
+    P::Target: ExpireAt,
+    N: Now,
+{
+    type Value = Instant;
+
+    const READ_LOCK: Lock = Lock::Shared;
+    const REMOVE_LOCK: Lock = Lock::Exclusive;
+    const INSERT_LOCK: Lock = Lock::Exclusive;
+    const PURGE_LOCK: Lock = Lock::Exclusive;
+
+    fn create_insert_shared_value(&self, target: &P::Target) -> Self::Value {
+        target.expire_at()
+    }
+
+    fn create_insert_value(&mut self, target: &P::Target) -> Self::Value {
+        target.expire_at()
+    }
+
+    #[inline]
+    fn read_shared(&self, pointer: &P) -> ReadShared {
+        if self.now.now() >= *pointer.strategy_value() {
+            ReadShared::Remove
+        } else {
+            ReadShared::Allow
+        }
+    }
+
+    fn read(&mut self, pointer: &P) -> ReadExclusive {
+        if self.now.now() >= *pointer.strategy_value() {
+            ReadExclusive::Remove
+        } else {
+            ReadExclusive::Allow
+        }
+    }
+
+    fn purge(&mut self) -> impl Iterator<Item = P> {
+        let now = self.now.now();
+        std::iter::from_fn(move || {
+            self.sorted
+                .first_entry()
+                .filter(|e| *e.key() <= now)
+                .map(|e| e.remove())
+        })
+        .take(16)
+    }
+}
