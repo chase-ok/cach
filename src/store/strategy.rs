@@ -4,7 +4,6 @@ use super::Pointer;
 
 mod and_then;
 pub use and_then::{AndThen, AndThenStrategy};
-use stable_deref_trait::StableDeref;
 
 mod buffered;
 

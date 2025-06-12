@@ -10,12 +10,13 @@ pub mod map;
 pub mod strategy;
 pub mod atomic;
 pub mod expire;
+pub mod layer;
 
 pub mod hash;
 
-pub trait Pointer: Deref + Clone + CloneStableDeref {}
+pub trait Pointer: Deref + CloneStableDeref {}
 
-impl<P: Deref + Clone + CloneStableDeref> Pointer for P {}
+impl<P: Deref + CloneStableDeref> Pointer for P {}
 
 pub trait Store<T> {
     type Pointer: Pointer<Target = T>;
@@ -55,7 +56,7 @@ pub trait Store<T> {
 
     fn remove(&self, value: &T) -> Option<Self::Pointer>;
 
-    fn upsert(&self, value: T, f: impl FnOnce(T, &Self::Pointer) -> Option<T>) -> Self::Pointer;
+    fn upsert(&self, value: T, f: impl for<'a> FnMut(&'a T, &'a Self::Pointer) -> &'a T) -> Self::Pointer;
 }
 
 pub trait BuildStore {

@@ -1,6 +1,6 @@
-use std::{marker::PhantomData, mem::ManuallyDrop};
+use std::{cell::RefMut, marker::PhantomData, mem::ManuallyDrop};
 
-use parking_lot::lock_api::{RawRwLock, RawRwLockDowngrade, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::lock_api::{RawMutex, RawRwLock, RawRwLockDowngrade, RwLockReadGuard, RwLockWriteGuard, MutexGuard};
 
 // Pulled from
 // https://github.com/xacrimon/dashmap/blob/master/src/util.rs
@@ -94,5 +94,62 @@ impl<'a, R: RawRwLockDowngrade> RwLockWriteGuardDetached<'a, R> {
             lock: this.lock,
             _marker: this._marker,
         }
+    }
+}
+
+/// A [`RefMut`], without the data
+pub(crate) struct RefMutDetached<'a, T> {
+    guard: RefMut<'a, T>,
+}
+
+impl<'a, T> RefMutDetached<'a, T> {
+    /// Separates the data from the [`RefMut`]
+    ///
+    /// # Safety
+    ///
+    /// The data must not outlive the detached guard
+    pub(crate) unsafe fn detach_from(mut guard: RefMut<'a, T>) -> (Self, &'a mut T) {
+        // Safety: There will be no concurrent writes as we are "forgetting" the existing guard,
+        // with the safety assumption that the caller will not drop the new detached guard early.
+        let data = unsafe { &mut *(&mut *guard as *mut T)};
+        (Self { guard }, data)
+    }
+}
+
+
+/// A [`MutexGuard`], without the data
+pub(crate) struct MutexGuardDetached<'a, R: RawMutex> {
+    lock: &'a R,
+    _marker: PhantomData<R::GuardMarker>,
+}
+
+impl<R: RawMutex> Drop for MutexGuardDetached<'_, R> {
+    fn drop(&mut self) {
+        // Safety: An MutxGuardDetached always holds an exclusive lock.
+        unsafe {
+            self.lock.unlock();
+        }
+    }
+}
+
+impl<'a, R: RawMutex> MutexGuardDetached<'a, R> {
+    /// Separates the data from the [`RwLockWriteGuard`]
+    ///
+    /// # Safety
+    ///
+    /// The data must not outlive the detached guard
+    pub(crate) unsafe fn detach_from<T>(guard: MutexGuard<'a, R, T>) -> (Self, &'a mut T) {
+        let mutex = MutexGuard::mutex(&ManuallyDrop::new(guard));
+
+        // Safety: There will be no concurrent reads/writes as we are "forgetting" the existing guard,
+        // with the safety assumption that the caller will not drop the new detached guard early.
+        let data = unsafe { &mut *mutex.data_ptr() };
+        let guard = MutexGuardDetached {
+            // Safety: We are imitating the original MutexGuard. It's the callers
+            // responsibility to not drop the guard early.
+            lock: unsafe { mutex.raw() },
+            _marker: PhantomData,
+        };
+        (guard, data)
     }
 }

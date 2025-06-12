@@ -127,15 +127,19 @@ where
     #[inline]
     fn remove(&self, value: &T) -> Option<Self::Pointer> {
         match self.entry_exclusive(value.key()) {
-            Entry::Occupied(o) => o.remove(),
+            Entry::Occupied(o) => o.remove_key(),
             Entry::Vacant(_) => None,
         }
     }
 
-    #[inline]
-    fn upsert(&self, value: T, f: impl FnOnce(T, &Self::Pointer) -> Option<T>) -> Self::Pointer {
-        hash::impl_upsert(self, value, f)
+    fn upsert(&self, value: T, f: impl for<'a> FnMut(&'a T, &'a Self::Pointer) -> &'a T) -> Self::Pointer {
+        todo!()
     }
+
+    // #[inline]
+    // fn upsert(&self, value: T, f: impl FnMut(T, &Self::Pointer) -> Option<T>) -> Self::Pointer {
+    //     hash::impl_upsert(self, value, f)
+    // }
 }
 
 impl<T, S, Sv, H> hash::Store<T> for SyncStore<T, S, Sv, H>
@@ -158,12 +162,9 @@ where
     }
 
     #[inline]
-    fn remove_key<K>(&self, key: &K) -> Option<Self::Pointer>
-    where
-        K: ?Sized + Hash + Equivalent<T::Key>,
-    {
+    fn remove_key(&self, key: &(impl ?Sized + Hash + Equivalent<T::Key>)) -> Option<Self::Pointer> {
         match self.entry_exclusive(key) {
-            Entry::Occupied(o) => o.remove(),
+            Entry::Occupied(o) => o.remove_key(),
             Entry::Vacant(_) => None,
         }
     }
@@ -328,7 +329,7 @@ where
         }
     }
 
-    fn try_remove(mut self) -> Result<Self::Pointer, Entry<Self, Self::VacantEntry>> {
+    fn remove(mut self) -> Result<Self::Pointer, Entry<Self, Self::VacantEntry>> {
         // XX do this to release lock guard without chance of still using refs
         let (current, store, hash, shard) =
             match std::mem::replace(&mut self.0, OccupiedEntryInner::None) {

@@ -1,7 +1,8 @@
 use super::{Entry, Pointer};
 use equivalent::Equivalent;
-use stable_deref_trait::StableDeref;
 use std::{hash::Hash, ops::Deref};
+
+mod papaya;
 
 pub trait Store<T: Value>: super::Store<T> {
     #[inline]
@@ -51,13 +52,20 @@ pub trait Store<T: Value>: super::Store<T> {
     }
 
     #[inline]
-    fn remove_key<K>(&self, key: &K) -> Option<Self::Pointer>
-    where
-        K: ?Sized + Hash + Equivalent<T::Key>,
-    {
+    fn remove_key(&self, key: &(impl ?Sized + Hash + Equivalent<T::Key>)) -> Option<Self::Pointer> {
+        self.remove_key_if(key, |_| true).ok().unwrap()
+    }
+
+    #[inline]
+    fn remove_key_if(
+        &self,
+        key: &(impl ?Sized + Hash + Equivalent<T::Key>),
+        mut f: impl FnMut(&Self::Pointer) -> bool,
+    ) -> Result<Option<Self::Pointer>, Self::Pointer> {
         match self.entry(key) {
-            Entry::Occupied(o) => o.remove(),
-            Entry::Vacant(_) => None,
+            Entry::Occupied(o) if f(o.pointer()) => Ok(o.remove_key()),
+            Entry::Occupied(o) => Err(o.into_pointer()),
+            Entry::Vacant(_) => Ok(None)
         }
     }
 }
@@ -79,13 +87,13 @@ pub trait OccupiedEntry<'a>: Sized + 'a {
 
     fn into_pointer(self) -> Self::Pointer;
 
-    fn try_remove(self) -> Result<Self::Pointer, Entry<Self, Self::VacantEntry>>;
+    fn remove(self) -> Result<Self::Pointer, Entry<Self, Self::VacantEntry>>;
 
     #[inline]
-    fn remove(self) -> Option<Self::Pointer> {
+    fn remove_key(self) -> Option<Self::Pointer> {
         let mut this = self;
         loop {
-            match this.try_remove() {
+            match this.remove() {
                 Ok(p) => return Some(p),
                 Err(Entry::Occupied(occupied)) => this = occupied,
                 Err(Entry::Vacant(_)) => return None,
@@ -174,7 +182,7 @@ where
 {
     match store.entry(value.key()) {
         Entry::Occupied(o) => o.into_pointer(),
-        Entry::Vacant(v) => v.insert(value)
+        Entry::Vacant(v) => v.insert(value),
     }
 }
 
@@ -188,7 +196,11 @@ where
 }
 
 #[inline]
-pub(crate) fn impl_upsert<T, S>(store: &S, value: T, f: impl FnOnce(T, &S::Pointer) -> Option<T>) -> S::Pointer
+pub(crate) fn impl_upsert<T, S>(
+    store: &S,
+    value: T,
+    f: impl FnOnce(T, &S::Pointer) -> Option<T>,
+) -> S::Pointer
 where
     T: Value,
     S: Store<T>,
