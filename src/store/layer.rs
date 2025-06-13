@@ -6,6 +6,9 @@ pub use and_then::AndThen;
 mod lock;
 pub use lock::{Local, Sync};
 
+mod buf;
+pub use buf::ReadBuffered;
+
 pub trait LayerPointer: Pointer {
     type LayerTarget;
 
@@ -24,7 +27,7 @@ pub trait LayerMut<P: LayerPointer<LayerTarget = Self::Value>> {
     fn operate_mut(&mut self) -> impl Operate<P> + '_;
 }
 
-pub trait BuildLayer<T> {
+pub trait BuildLayer<T>: Sized {
     type Value: 'static;
 
     type Layer<P>: Layer<P, Value = Self::Value>
@@ -33,18 +36,14 @@ pub trait BuildLayer<T> {
 
     fn build<P>(self) -> Self::Layer<P>
     where
-        Self: Sized,
         P: LayerPointer<LayerTarget = Self::Value>;
 
-    fn and_then<N>(self, next: N) -> AndThen<Self, N>
-    where
-        Self: Sized,
-    {
+    fn and_then<N>(self, next: N) -> AndThen<Self, N> {
         AndThen::new(self, next)
     }
 }
 
-pub trait BuildLayerMut<T> {
+pub trait BuildLayerMut<T>: Sized {
     type Value: 'static;
 
     type LayerMut<P>: LayerMut<P, Value = Self::Value>
@@ -53,28 +52,27 @@ pub trait BuildLayerMut<T> {
 
     fn build_mut<P>(self) -> Self::LayerMut<P>
     where
-        Self: Sized,
         P: LayerPointer<LayerTarget = Self::Value>;
 
     fn and_then<N>(self, next: N) -> AndThen<Self, N>
-    where
-        Self: Sized,
     {
         AndThen::new(self, next)
     }
 
-    fn local(self) -> Local<Self>
-    where
-        Self: Sized,
-    {
+    fn local(self) -> Local<Self> {
         Local::new(self)
     }
 
-    fn sync(self) -> Sync<Self>
-    where
-        Self: Sized,
-    {
+    fn sync(self) -> Sync<Self> {
         Sync::new(self)
+    }
+
+    fn buffered(self) -> ReadBuffered<Self> {
+        ReadBuffered::new(self)
+    }
+
+    fn buffered_with_capacity(self, capacity: usize) -> ReadBuffered<Self> {
+        ReadBuffered::with_capacity(self, capacity)
     }
 }
 
