@@ -4,9 +4,6 @@ use std::{
     ops::Deref,
 };
 
-pub mod atomic;
-pub mod sharded;
-
 pub mod store;
 
 pub(crate) mod lock;

@@ -3,6 +3,7 @@ use equivalent::Equivalent;
 use std::{hash::Hash, ops::Deref};
 
 mod papaya;
+mod sync;
 
 pub trait Store<T: Value>: super::Store<T> {
     #[inline]

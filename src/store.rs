@@ -1,14 +1,11 @@
 use equivalent::{Comparable, Equivalent};
 use stable_deref_trait::CloneStableDeref;
-use strategy::{BuildStrategy, NoStrategy};
 use std::array;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::{Bound, Deref, RangeBounds};
 
 pub mod map;
-pub mod strategy;
-pub mod atomic;
 pub mod expire;
 pub mod evict;
 pub mod layer;
@@ -60,20 +57,20 @@ pub trait Store<T> {
     fn upsert(&self, value: T, f: impl for<'a> FnMut(&'a T, &'a Self::Pointer) -> &'a T) -> Self::Pointer;
 }
 
-pub trait BuildStore {
-    type Store<T: 'static + hash::Value + Send + Sync, S>: Store<T>
-    where
-        S: BuildStrategy<T>;
+// pub trait BuildStore {
+//     type Store<T: 'static + hash::Value + Send + Sync, S>: Store<T>
+//     where
+//         S: BuildStrategy<T>;
 
-    fn build_store<T: 'static + hash::Value + Send + Sync>(self) -> Self::Store<T, NoStrategy>
-    where
-        Self: Sized
-    {
-        self.build_store_with_strategy(NoStrategy)
-    }
+//     fn build_store<T: 'static + hash::Value + Send + Sync>(self) -> Self::Store<T, NoStrategy>
+//     where
+//         Self: Sized
+//     {
+//         self.build_store_with_strategy(NoStrategy)
+//     }
 
-    fn build_store_with_strategy<T: 'static + hash::Value + Send + Sync, S: BuildStrategy<T>>(self, layer: S) -> Self::Store<T, S>;
-}
+//     fn build_store_with_strategy<T: 'static + hash::Value + Send + Sync, S: BuildStrategy<T>>(self, layer: S) -> Self::Store<T, S>;
+// }
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
