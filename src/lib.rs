@@ -11,6 +11,8 @@ pub mod store;
 
 pub(crate) mod lock;
 
+pub mod time;
+
 pub trait Cache<T: Value> {
     type Pointer: Deref<Target = T> + Clone;
 

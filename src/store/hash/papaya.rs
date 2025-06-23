@@ -5,14 +5,14 @@ use std::{
 };
 
 use equivalent::Equivalent;
-use hashbrown::HashTable;
 use papaya::{Compute, LocalGuard, Operation};
 use ref_cast::RefCast;
+use smallvec::SmallVec;
 use stable_deref_trait::{CloneStableDeref, StableDeref};
 
 use crate::store::{
     Entry, Store as _,
-    layer::{Layer, LayerPointer, Operate, Purge, Remove, StartRead},
+    layer::{Layer, LayerPointer, Operate, Purge, StartRead},
 };
 
 use super::Store as _;
@@ -102,7 +102,6 @@ impl<K: ?Sized + Eq> Eq for KeyRef<'_, K> {}
 pub struct Store<T, L, V, H: BuildHasher = std::hash::RandomState> {
     map: papaya::HashMap<Arc<Value<T, V>>, (), H>,
     layer: L,
-    hasher: H,
 }
 
 impl<T, L, V, H> crate::store::Store<T> for Store<T, L, V, H>
@@ -119,10 +118,71 @@ where
     }
 
     fn iter(&self) -> impl Iterator<Item = Self::Pointer> {
+        let guard = self.map.guard();
+
         // XX: borrow preventing lazy iterator :(
         let mut vec = Vec::with_capacity(self.len());
-        vec.extend(self.map.pin().keys().map(Pointer::from_ref));
-        vec.into_iter()
+        vec.extend(
+            self.map
+                .iter(&guard)
+                .map(|(arc, ())| Pointer::from_ref(arc)),
+        );
+
+        // annoyingly, chunks from itertools borrows the iter :(
+        const CHUNK_SIZE: usize = 32;
+
+        struct Iter<'a, I, T, L, V, H: BuildHasher> {
+            iter: I,
+            chunk: SmallVec<[Pointer<T, V>; CHUNK_SIZE]>,
+            guard: LocalGuard<'a>,
+            store: &'a Store<T, L, V, H>,
+        }
+
+        impl<I, T, L, V, H> Iterator for Iter<'_, I, T, L, V, H>
+        where
+            I: Iterator<Item = Pointer<T, V>>,
+            T: super::Value + Send + Sync + 'static,
+            L: Layer<Pointer<T, V>, Value = V>,
+            V: Send + Sync + 'static,
+            H: BuildHasher,
+        {
+            type Item = Pointer<T, V>;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.chunk.is_empty() {
+                    let mut operate = self.store.operate(&self.guard);
+                    while let Some(pointer) = self.iter.next() {
+                        match operate.start_read(&pointer) {
+                            StartRead::Allow => {
+                                // XX technically not yet yielded?
+                                operate.complete_read(&pointer);
+                                self.chunk.push(pointer);
+                            }
+                            StartRead::Remove => {
+                                let _ = self.store.do_remove_key_if(
+                                    pointer.key(),
+                                    |existing| Arc::ptr_eq(&existing.0, &pointer.0),
+                                    &self.guard,
+                                    &mut operate,
+                                );
+                            }
+                        }
+
+                        if self.chunk.len() >= CHUNK_SIZE {
+                            break;
+                        }
+                    }
+                }
+                self.chunk.pop()
+            }
+        }
+
+        Iter {
+            iter: vec.into_iter().fuse(),
+            chunk: SmallVec::new(),
+            guard,
+            store: self,
+        }
     }
 
     fn extract_if(
@@ -130,18 +190,10 @@ where
         mut f: impl FnMut(&Self::Pointer) -> bool,
     ) -> impl Iterator<Item = Self::Pointer> {
         // XX: borrow preventing lazy iterator :(
-        let mut set = HashTable::<Pointer<T, V>>::with_capacity(self.len());
-        let hash = |p: &Pointer<T, V>| self.hasher.hash_one(Arc::as_ptr(&p.0).addr());
-        self.map.pin().retain(|arc, ()| {
-            let pointer = Pointer::ref_cast(arc);
-            let retain = !f(pointer);
-            if !retain {
-                set.entry(hash(pointer), |p| Arc::ptr_eq(&p.0, arc), hash)
-                    .or_insert_with(|| pointer.clone());
-            }
-            retain
-        });
-        set.into_iter()
+        // XX: can't give spurious extra pointers, so not using retain directly
+        // XX: could optimize to reduce number of operate() calls!
+        self.iter()
+            .filter(move |pointer| f(&pointer) && self.remove(&pointer).is_some())
     }
 
     fn clear(&self) {
@@ -234,15 +286,11 @@ where
         key: &K,
     ) -> Entry<OccupiedEntry<'a, T, L, V, H>, VacantEntry<'a, T, L, V, H>>
     where
-        K: ?Sized + Hash + Equivalent<<T as super::Value>::Key>,
+        K: ?Sized + Hash + Equivalent<T::Key>,
     {
-        todo!()
-    }
-
-    fn get(&self, key: &(impl ?Sized + Hash + Equivalent<T::Key>)) -> Option<Self::Pointer> {
         let guard = self.map.guard();
         let mut operate = self.operate(&guard);
-        match self.map.get_key_value(&KeyRef(key), &guard) {
+        let pointer = match self.map.get_key_value(&KeyRef(key), &guard) {
             Some((arc, ())) => {
                 let pointer = Pointer::ref_cast(arc);
                 match operate.start_read(pointer) {
@@ -273,15 +321,26 @@ where
                                 let _ = operate.remove(Pointer::ref_cast(arc));
                                 None
                             }
-                            Compute::Aborted(pointer) => {
-                                pointer.inspect(|p| operate.complete_read(p)).cloned()
+                            Compute::Aborted(Some(pointer)) => {
+                                operate.complete_read(pointer);
+                                Some(pointer.clone())
                             }
+                            Compute::Aborted(None) => None,
                             _ => unreachable!(),
                         }
                     }
                 }
             }
             None => None,
+        };
+
+        match pointer {
+            Some(pointer) => Entry::Occupied(OccupiedEntry {
+                guard,
+                store: self,
+                pointer,
+            }),
+            None => Entry::Vacant(VacantEntry { guard, store: self }),
         }
     }
 
@@ -343,7 +402,7 @@ where
         f: impl FnMut(&Self::Pointer) -> bool,
     ) -> Result<Option<Self::Pointer>, Self::Pointer> {
         let guard = self.map.guard();
-        self.do_remove_key_if(key, f, &guard)
+        self.do_remove_key_if(key, f, &guard, &mut self.operate(&guard))
     }
 }
 
@@ -511,8 +570,8 @@ where
         key: &(impl ?Sized + Hash + Equivalent<T::Key>),
         mut f: impl FnMut(&Pointer<T, V>) -> bool,
         guard: &LocalGuard<'_>,
+        operate: &mut impl Operate<Pointer<T, V>>,
     ) -> Result<Option<Pointer<T, V>>, Pointer<T, V>> {
-        let mut operate = self.operate(&guard);
         let mut read_allowed = false;
         let removed = self.map.remove_if(
             &KeyRef(key),
@@ -585,16 +644,29 @@ where
             self.pointer.key(),
             |existing| Arc::ptr_eq(&self.pointer.0, &existing.0),
             &self.guard,
+            &mut self.store.operate(&self.guard),
         ) {
             Ok(Some(pointer)) => Ok(pointer),
-            Ok(None) => Err(Entry::Vacant(VacantEntry { guard: self.guard, store: self.store })),
-            Err(pointer) => Err(Entry::Occupied(OccupiedEntry { guard: self.guard, store: self.store, pointer }))
+            Ok(None) => Err(Entry::Vacant(VacantEntry {
+                guard: self.guard,
+                store: self.store,
+            })),
+            Err(pointer) => Err(Entry::Occupied(OccupiedEntry {
+                guard: self.guard,
+                store: self.store,
+                pointer,
+            })),
         }
     }
 
     fn remove_key(self) -> Option<Self::Pointer> {
         self.store
-            .do_remove_key_if(self.pointer.key(), |_| true, &self.guard)
+            .do_remove_key_if(
+                self.pointer.key(),
+                |_| true,
+                &self.guard,
+                &mut self.store.operate(&self.guard),
+            )
             .unwrap_or_default()
     }
 

@@ -33,11 +33,11 @@ where
         B1::Value,
     >
     where
-        P: LayerPointer<LayerTarget = Self::Value>;
+        P: LayerPointer<LayerTarget = Self::Value, Target = T>;
 
     fn build<P>(self) -> Self::Layer<P>
     where
-        P: LayerPointer<LayerTarget = Self::Value>,
+        P: LayerPointer<LayerTarget = Self::Value, Target = T>,
     {
         AndThenLayer {
             layer_0: self.build_0.build(),
@@ -62,11 +62,11 @@ where
         B1::Value,
     >
     where
-        P: LayerPointer<LayerTarget = Self::Value>;
+        P: LayerPointer<LayerTarget = Self::Value, Target = T>;
 
     fn build_mut<P>(self) -> Self::LayerMut<P>
     where
-        P: LayerPointer<LayerTarget = Self::Value>,
+        P: LayerPointer<LayerTarget = Self::Value, Target = T>,
     {
         AndThenLayer {
             layer_0: self.build_0.build_mut(),

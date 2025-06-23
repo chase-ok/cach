@@ -1,217 +1,254 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::{Duration, Instant},
-};
+use std::{cell::LazyCell, sync::atomic::Ordering, time::{Duration, Instant}};
 
-use super::{
-    Pointer,
-    strategy::{BuildStrategy, Lock, ReadExclusive, ReadShared, Strategy, StrategyPointer},
-};
+use crate::{store::layer::{BuildLayer, Layer}, time::{AtomicInstant, Clock, SystemInstant}};
 
-pub trait Expire<P: Pointer> {
-    type Value: 'static;
+use super::layer::{LayerPointer, Operate, StartRead};
 
-    fn insert(&self, target: &P::Target) -> Self::Value;
 
-    // XX must be const
-    fn expires_at(&self, pointer: &P, value: &Self::Value) -> Instant;
-}
 
-pub struct ExpireLayer<E, N = SystemInstant>(E, N);
-
-impl<P, E, N> Strategy<P> for ExpireLayer<E, N>
-where
-    P: StrategyPointer<StrategyValue = E::Value>,
-    E: Expire<P>,
-    N: Now,
-{
-    type Value = E::Value;
-
-    const READ_LOCK: Lock = Lock::Shared;
-    const REMOVE_LOCK: Lock = Lock::Shared;
-    const INSERT_LOCK: Lock = Lock::Shared;
-    const PURGE_LOCK: Lock = Lock::Shared;
-
-    fn create_insert_shared_value(&self, target: &P::Target) -> Self::Value {
-        self.0.insert(target)
-    }
-
-    fn create_insert_value(&mut self, target: &P::Target) -> Self::Value {
-        self.0.insert(target)
-    }
-
-    #[inline]
-    fn read_shared(&self, pointer: &P) -> ReadShared {
-        if self.1.now() >= self.0.expires_at(pointer, pointer.strategy_value()) {
-            ReadShared::Remove
-        } else {
-            ReadShared::Allow
-        }
-    }
-
-    fn read(&mut self, pointer: &P) -> ReadExclusive {
-        if self.1.now() >= self.0.expires_at(pointer, pointer.strategy_value()) {
-            ReadExclusive::Remove
-        } else {
-            ReadExclusive::Allow
-        }
-    }
-}
-
-pub trait Now: Clone {
-    fn now(&self) -> Instant;
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct SystemInstant;
-
-impl Now for SystemInstant {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ExpireAfterWrite<N = SystemInstant> {
-    now: N,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpireAfterWriteLayer<C = SystemInstant> {
+    clock: C,
     duration: Duration,
 }
 
-impl ExpireAfterWrite {
-    pub fn new(duration: Duration) -> Self {
-        Self {
-            now: SystemInstant,
-            duration,
+impl<T, C: Clock> BuildLayer<T> for ExpireAfterWriteLayer<C> {
+    type Value = Instant;
+
+    type Layer<P> = Self
+    where
+        P: LayerPointer<LayerTarget = Self::Value, Target = T>;
+
+    fn build<P>(self) -> Self::Layer<P>
+    where
+        P: LayerPointer<LayerTarget = Self::Value, Target = T>
+    {
+        self
+    }
+}
+
+impl<P, C> Layer<P> for ExpireAfterWriteLayer<C>
+where
+    P: LayerPointer<LayerTarget = Instant>,
+    C: Clock,
+{
+    type Value = Instant;
+
+    fn operate(&self) -> impl Operate<P> + '_ {
+        struct Op<F> {
+            now: LazyCell<Instant, F>,
+            duration: Duration,
+        }
+
+        impl<P, F> Operate<P> for Op<F>
+        where
+            P: LayerPointer<LayerTarget = Instant>,
+            F: FnOnce() -> Instant
+        {
+            fn start_insert(&mut self, _target: &P::Target) -> Instant {
+                *self.now + self.duration
+            }
+
+            fn start_read(&mut self, pointer: &P) -> StartRead {
+                if *self.now >= *pointer.layer() {
+                    StartRead::Remove
+                } else {
+                    StartRead::Allow
+                }
+            }
+        }
+
+        Op {
+            now: LazyCell::new(|| self.clock.now()),
+            duration: self.duration,
         }
     }
 }
 
-impl<P: Pointer, N: Now> Expire<P> for ExpireAfterWrite<N> {
-    type Value = Instant;
-
-    fn insert(&self, _target: &P::Target) -> Self::Value {
-        self.now.now() + self.duration
-    }
-
-    fn expires_at(&self, _pointer: &P, value: &Self::Value) -> Instant {
-        *value
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpireAfterReadLayer<C = SystemInstant> {
+    clock: C,
+    duration: Duration,
 }
 
-impl<T, N: Now> BuildStrategy<T> for ExpireAfterWrite<N> {
-    type Value = Instant;
+impl<T, C: Clock> BuildLayer<T> for ExpireAfterReadLayer<C> {
+    type Value = AtomicInstant;
 
-    type Strategy<P>
-        = ExpireLayer<Self, N>
+    type Layer<P> = Self
     where
-        P: StrategyPointer<Target = T, StrategyValue = Self::Value>;
+        P: LayerPointer<LayerTarget = Self::Value, Target = T>;
 
-    fn build_sharded<P>(self, shards: usize) -> impl Iterator<Item = Self::Strategy<P>>
+    fn build<P>(self) -> Self::Layer<P>
     where
-        P: StrategyPointer<Target = T, StrategyValue = Self::Value>,
+        P: LayerPointer<LayerTarget = Self::Value, Target = T>
     {
-        std::iter::repeat_with(move || ExpireLayer(self.clone(), self.now.clone())).take(shards)
+        self
     }
 }
 
-#[derive(Default, Debug, Clone, Copy)]
-pub struct ExpireAtIntrusive<N = SystemInstant> {
-    now: N,
+impl<P, C> Layer<P> for ExpireAfterReadLayer<C>
+where
+    P: LayerPointer<LayerTarget = AtomicInstant>,
+    C: Clock,
+{
+    type Value = AtomicInstant;
+
+    fn operate(&self) -> impl Operate<P> + '_ {
+        struct Op<F> {
+            now: LazyCell<Instant, F>,
+            duration: Duration,
+        }
+
+        impl<P, F> Operate<P> for Op<F>
+        where
+            P: LayerPointer<LayerTarget = AtomicInstant>,
+            F: FnOnce() -> Instant
+        {
+            fn start_insert(&mut self, _target: &P::Target) -> AtomicInstant {
+                AtomicInstant::new(*self.now + self.duration)
+            }
+
+            fn start_read(&mut self, pointer: &P) -> StartRead {
+                // XX: should we do Acquire + Release ordering?
+                if *self.now >= pointer.layer().load(Ordering::Relaxed) {
+                    StartRead::Remove
+                } else {
+                    StartRead::Allow
+                }
+            }
+
+            fn complete_read(&mut self, pointer: &P) {
+                pointer.layer().store(*self.now + self.duration, Ordering::Relaxed);
+            }
+        }
+
+        Op {
+            now: LazyCell::new(|| self.clock.now()),
+            duration: self.duration,
+        }
+    }
 }
 
-impl ExpireAtIntrusive {
-    pub const fn new() -> Self {
-        Self { now: SystemInstant }
-    }
+#[derive(Clone, Copy, Debug)]
+pub struct ExpireAtFixedLayer<C = SystemInstant> {
+    clock: C,
 }
 
 pub trait ExpireAt {
-    fn expire_at(&self) -> Instant;
+    fn expire_at(&self, now: Instant) -> Instant;
 }
 
-impl<P: Pointer, N: Now> Expire<P> for ExpireAtIntrusive<N>
-where
-    P::Target: ExpireAt,
-{
-    type Value = ();
+impl<T: ExpireAt, C: Clock> BuildLayer<T> for ExpireAtFixedLayer<C> {
+    type Value = Instant;
 
-    fn insert(&self, _target: &P::Target) -> Self::Value {
-        ()
-    }
-
-    fn expires_at(&self, pointer: &P, _value: &Self::Value) -> Instant {
-        // XX make const?
-        pointer.expire_at()
-    }
-}
-
-impl<T: ExpireAt, N: Now> BuildStrategy<T> for ExpireAtIntrusive<N> {
-    type Value = ();
-
-    type Strategy<P>
-        = ExpireLayer<Self, N>
+    type Layer<P> = Self
     where
-        P: StrategyPointer<Target = T, StrategyValue = Self::Value>;
+        P: LayerPointer<LayerTarget = Self::Value, Target = T>;
 
-    fn build_sharded<P>(self, shards: usize) -> impl Iterator<Item = Self::Strategy<P>>
+    fn build<P>(self) -> Self::Layer<P>
     where
-        P: StrategyPointer<Target = T, StrategyValue = Self::Value>,
+        P: LayerPointer<LayerTarget = Self::Value, Target = T>
     {
-        std::iter::repeat_with(move || ExpireLayer(self.clone(), self.now.clone())).take(shards)
+        self
     }
 }
 
-pub struct ExpireFrozenLayer<P, N = SystemInstant> {
-    now: N,
-    sorted: BTreeMap<Instant, P>,
-}
-
-impl<P, N> Strategy<P> for ExpireFrozenLayer<P, N>
+impl<P, C> Layer<P> for ExpireAtFixedLayer<C>
 where
-    P: StrategyPointer<StrategyValue = Instant>,
+    P: LayerPointer<LayerTarget = Instant>,
     P::Target: ExpireAt,
-    N: Now,
+    C: Clock,
 {
     type Value = Instant;
 
-    const READ_LOCK: Lock = Lock::Shared;
-    const REMOVE_LOCK: Lock = Lock::Exclusive;
-    const INSERT_LOCK: Lock = Lock::Exclusive;
-    const PURGE_LOCK: Lock = Lock::Exclusive;
+    fn operate(&self) -> impl Operate<P> + '_ {
+        struct Op<F> {
+            now: LazyCell<Instant, F>,
+        }
 
-    fn create_insert_shared_value(&self, target: &P::Target) -> Self::Value {
-        target.expire_at()
-    }
+        impl<P, F> Operate<P> for Op<F>
+        where
+            P: LayerPointer<LayerTarget = Instant>,
+            P::Target: ExpireAt,
+            F: FnOnce() -> Instant
+        {
+            fn start_insert(&mut self, target: &P::Target) -> Instant {
+                target.expire_at(*self.now)
+            }
 
-    fn create_insert_value(&mut self, target: &P::Target) -> Self::Value {
-        target.expire_at()
-    }
+            fn start_read(&mut self, pointer: &P) -> StartRead {
+                if *self.now >= *pointer.layer() {
+                    StartRead::Remove
+                } else {
+                    StartRead::Allow
+                }
+            }
+        }
 
-    #[inline]
-    fn read_shared(&self, pointer: &P) -> ReadShared {
-        if self.now.now() >= *pointer.strategy_value() {
-            ReadShared::Remove
-        } else {
-            ReadShared::Allow
+        Op {
+            now: LazyCell::new(|| self.clock.now()),
         }
     }
+}
 
-    fn read(&mut self, pointer: &P) -> ReadExclusive {
-        if self.now.now() >= *pointer.strategy_value() {
-            ReadExclusive::Remove
-        } else {
-            ReadExclusive::Allow
-        }
+#[derive(Clone, Copy, Debug)]
+pub struct ExpireAtLayer<C = SystemInstant> {
+    clock: C,
+}
+
+impl<T: ExpireAt, C: Clock> BuildLayer<T> for ExpireAtLayer<C> {
+    type Value = AtomicInstant;
+
+    type Layer<P> = Self
+    where
+        P: LayerPointer<LayerTarget = Self::Value, Target = T>;
+
+    fn build<P>(self) -> Self::Layer<P>
+    where
+        P: LayerPointer<LayerTarget = Self::Value, Target = T>
+    {
+        self
     }
+}
 
-    fn purge(&mut self) -> impl Iterator<Item = P> {
-        let now = self.now.now();
-        std::iter::from_fn(move || {
-            self.sorted
-                .first_entry()
-                .filter(|e| *e.key() <= now)
-                .map(|e| e.remove())
-        })
-        .take(16)
+impl<P, C> Layer<P> for ExpireAtLayer<C>
+where
+    P: LayerPointer<LayerTarget = AtomicInstant>,
+    P::Target: ExpireAt,
+    C: Clock,
+{
+    type Value = AtomicInstant;
+
+    fn operate(&self) -> impl Operate<P> + '_ {
+        struct Op<F> {
+            now: LazyCell<Instant, F>,
+        }
+
+        impl<P, F> Operate<P> for Op<F>
+        where
+            P: LayerPointer<LayerTarget = AtomicInstant>,
+            P::Target: ExpireAt,
+            F: FnOnce() -> Instant
+        {
+            fn start_insert(&mut self, target: &P::Target) -> AtomicInstant {
+                AtomicInstant::new(target.expire_at(*self.now))
+            }
+
+            fn start_read(&mut self, pointer: &P) -> StartRead {
+                if *self.now >= pointer.layer().load(Ordering::Relaxed) {
+                    StartRead::Remove
+                } else {
+                    StartRead::Allow
+                }
+            }
+
+            fn complete_read(&mut self, pointer: &P) {
+                pointer.layer().store(pointer.expire_at(*self.now), Ordering::Relaxed);
+            }
+        }
+
+        Op {
+            now: LazyCell::new(|| self.clock.now()),
+        }
     }
 }

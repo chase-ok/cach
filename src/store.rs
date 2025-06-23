@@ -10,6 +10,7 @@ pub mod map;
 pub mod strategy;
 pub mod atomic;
 pub mod expire;
+pub mod evict;
 pub mod layer;
 
 pub mod hash;
@@ -379,32 +380,32 @@ pub trait OrdValue {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    // use std::time::{Duration, Instant};
 
-    use super::{expire::{ExpireAfterWrite, ExpireAt, ExpireAtIntrusive}, BuildStore, hash::Value, Store};
+    // use super::{expire::{ExpireAfterWrite, ExpireAt, ExpireAtIntrusive}, BuildStore, hash::Value, Store};
 
-    struct TestValue {
-        x: u64,
-        expire_at: Instant,
-    }
+    // struct TestValue {
+    //     x: u64,
+    //     expire_at: Instant,
+    // }
 
-    impl Value for TestValue {
-        type Key = u64;
+    // impl Value for TestValue {
+    //     type Key = u64;
 
-        fn key(&self) -> &Self::Key {
-            &self.x
-        }
-    }
+    //     fn key(&self) -> &Self::Key {
+    //         &self.x
+    //     }
+    // }
 
-    impl ExpireAt for TestValue {
-        fn expire_at(&self) -> Instant {
-            self.expire_at
-        }
-    }
+    // impl ExpireAt for TestValue {
+    //     fn expire_at(&self) -> Instant {
+    //         self.expire_at
+    //     }
+    // }
 
-    fn compiles(x: impl BuildStore) {
-        let store = x.build_store_with_strategy::<TestValue, _>(ExpireAtIntrusive::new());
-        let p = store.insert(TestValue { x: 1, expire_at: Instant::now() });
-        p.x;
-    }
+    // fn compiles(x: impl BuildStore) {
+    //     let store = x.build_store_with_strategy::<TestValue, _>(ExpireAtIntrusive::new());
+    //     let p = store.insert(TestValue { x: 1, expire_at: Instant::now() });
+    //     p.x;
+    // }
 }

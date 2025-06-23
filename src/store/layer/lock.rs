@@ -23,12 +23,12 @@ where
     type Layer<P>
         = LocalLayer<B::LayerMut<P>>
     where
-        P: super::LayerPointer<LayerTarget = Self::Value>;
+        P: super::LayerPointer<LayerTarget = Self::Value, Target = T>;
 
     fn build<P>(self) -> Self::Layer<P>
     where
         Self: Sized,
-        P: super::LayerPointer<LayerTarget = Self::Value>,
+        P: super::LayerPointer<LayerTarget = Self::Value, Target = T>,
     {
         LocalLayer(RefCell::new(self.0.build_mut()))
     }
@@ -72,12 +72,12 @@ where
     type Layer<P>
         = SyncLayer<B::LayerMut<P>>
     where
-        P: super::LayerPointer<LayerTarget = Self::Value>;
+        P: super::LayerPointer<LayerTarget = Self::Value, Target = T>;
 
     fn build<P>(self) -> Self::Layer<P>
     where
         Self: Sized,
-        P: super::LayerPointer<LayerTarget = Self::Value>,
+        P: super::LayerPointer<LayerTarget = Self::Value, Target = T>,
     {
         SyncLayer(Mutex::new(self.0.build_mut()))
     }
