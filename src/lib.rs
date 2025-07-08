@@ -5,10 +5,11 @@ use std::{
 };
 
 pub mod store;
+pub mod time;
 
 pub(crate) mod lock;
-
-pub mod time;
+pub(crate) mod thread;
+pub(crate) mod tagged;
 
 pub trait Cache<T: Value> {
     type Pointer: Deref<Target = T> + Clone;

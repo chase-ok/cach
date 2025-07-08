@@ -38,10 +38,10 @@ pub trait Store<T> {
         self.extract_if(move |v| !f(v)).for_each(drop);
     }
 
-    fn extract_if(
-        &self,
-        f: impl FnMut(&Self::Pointer) -> bool,
-    ) -> impl Iterator<Item = Self::Pointer>;
+    fn extract_if<'a>(
+        &'a self,
+        f: impl FnMut(&Self::Pointer) -> bool + 'a,
+    ) -> impl Iterator<Item = Self::Pointer> + 'a;
 
     #[inline]
     fn clear(&self) {
@@ -50,7 +50,10 @@ pub trait Store<T> {
 
     fn insert(&self, value: T) -> Self::Pointer;
 
-    fn or_insert(&self, value: T) -> Self::Pointer;
+    #[inline]
+    fn or_insert(&self, value: T) -> Self::Pointer {
+        self.upsert(value, |_new, existing| &existing)
+    }
 
     fn remove(&self, value: &T) -> Option<Self::Pointer>;
 

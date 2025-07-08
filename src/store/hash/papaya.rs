@@ -185,10 +185,10 @@ where
         }
     }
 
-    fn extract_if(
-        &self,
-        mut f: impl FnMut(&Self::Pointer) -> bool,
-    ) -> impl Iterator<Item = Self::Pointer> {
+    fn extract_if<'a>(
+        &'a self,
+        mut f: impl FnMut(&Self::Pointer) -> bool + 'a,
+    ) -> impl Iterator<Item = Self::Pointer> + 'a {
         // XX: borrow preventing lazy iterator :(
         // XX: can't give spurious extra pointers, so not using retain directly
         // XX: could optimize to reduce number of operate() calls!
@@ -639,7 +639,7 @@ where
         self.pointer
     }
 
-    fn remove(self) -> Result<Self::Pointer, Entry<Self, Self::VacantEntry>> {
+    fn try_remove(self) -> Result<Self::Pointer, Entry<Self, Self::VacantEntry>> {
         match self.store.do_remove_key_if(
             self.pointer.key(),
             |existing| Arc::ptr_eq(&self.pointer.0, &existing.0),

@@ -8,6 +8,7 @@ use parking_lot::{Mutex, RawMutex};
 use scc::Bag;
 
 use crate::lock::MutexGuardDetached;
+use crate::thread::ThreadSharded;
 
 use super::{BuildLayer, Layer, LayerMut, LayerPointer, Operate as _, Purge, Remove, StartRead};
 
@@ -240,7 +241,7 @@ where
 
 pub struct ReadBufferedLayer<L, P> {
     layer: Mutex<L>,
-    bags: Vec<crossbeam_utils::CachePadded<scc::Bag<P>>>,
+    bags: ThreadSharded<scc::Bag<P>>,
     bag_cap: usize,
     mask: usize,
 }
@@ -253,15 +254,14 @@ where
     type Value = L::Value;
 
     fn operate(&self) -> impl super::Operate<P> + '_ {
-        let id = id();
-        let bag = &self.bags[id & self.mask];
+        let bag = self.bags.get();
         if bag.len() >= self.bag_cap {
             if let Some(layer) = self.layer.try_lock() {
                 // XX
                 let (_guard, layer) = unsafe { MutexGuardDetached::detach_from(layer) };
                 let mut operate = layer.operate_mut();
 
-                for bag in &self.bags {
+                for bag in self.bags.iter() {
                     bag.pop_all((), |(), p| operate.complete_read(&p));
                 }
 

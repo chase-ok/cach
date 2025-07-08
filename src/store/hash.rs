@@ -5,6 +5,8 @@ use std::{hash::Hash, ops::Deref};
 mod papaya;
 mod sync;
 
+pub use sync::FixedCapSyncHashStore;
+
 pub trait Store<T: Value>: super::Store<T> {
     #[inline]
     fn keys(&self) -> impl Iterator<Item = impl Deref<Target = T::Key>> {
@@ -88,13 +90,13 @@ pub trait OccupiedEntry<'a>: Sized + 'a {
 
     fn into_pointer(self) -> Self::Pointer;
 
-    fn remove(self) -> Result<Self::Pointer, Entry<Self, Self::VacantEntry>>;
+    fn try_remove(self) -> Result<Self::Pointer, Entry<Self, Self::VacantEntry>>;
 
     #[inline]
     fn remove_key(self) -> Option<Self::Pointer> {
         let mut this = self;
         loop {
-            match this.remove() {
+            match this.try_remove() {
                 Ok(p) => return Some(p),
                 Err(Entry::Occupied(occupied)) => this = occupied,
                 Err(Entry::Vacant(_)) => return None,

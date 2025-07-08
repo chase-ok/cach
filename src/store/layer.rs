@@ -81,6 +81,7 @@ pub trait Operate<P: LayerPointer> {
     fn purge<'a>(&mut self, _purge: impl Purge<'a, P>) {}
 
     #[inline]
+    #[must_use]
     fn start_read(&mut self, _pointer: &P) -> StartRead {
         StartRead::Remove
     }
@@ -97,6 +98,7 @@ pub trait Operate<P: LayerPointer> {
     fn complete_insert(&mut self, _pointer: &P) {}
 
     #[inline]
+    #[must_use]
     fn remove(&mut self, pointer: &P) -> Remove {
         match self.start_read(pointer) {
             StartRead::Allow => Remove::Allow,
