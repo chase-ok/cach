@@ -1,23 +1,21 @@
 use std::{
     hash::{BuildHasher, Hash},
     mem,
-    ops::{AddAssign, Deref},
+    ops::Deref,
     sync::Arc,
 };
 
 use crossbeam_utils::CachePadded;
 use equivalent::Equivalent;
 use hashbrown::DefaultHashBuilder;
-use parking_lot::{
-    RawRwLock, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard,
-};
-use smallvec::SmallVec;
+use parking_lot::{RawRwLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use smallvec::{SmallVec, smallvec};
 use stable_deref_trait::{CloneStableDeref, StableDeref};
 
 use crate::{
     store::{
         Entry,
-        hash::Store,
+        hash::{OccupiedEntry as _, Store, VacantEntry as _},
         layer::{Layer, LayerPointer, Operate, Purge, Remove, StartRead},
     },
     thread::ThreadShardedCounter,
@@ -90,8 +88,7 @@ impl<T, L, V, H> FixedCapSyncHashStore<T, L, V, H> {
     {
         let slots = (cap as f64 / 0.75).ceil() as usize; // XX load factor
         let num_lockboxes = slots
-            .div_ceil(LOCKBOX_LEN)
-            // XX don't need any more, along with mask?
+            .div_ceil(1 << OFFSET_BITS)
             .checked_next_power_of_two()
             .expect("out of capacity");
         Self {
@@ -121,57 +118,37 @@ where
     }
 
     fn iter(&self) -> impl Iterator<Item = Self::Pointer> {
-        self.table.iter().flat_map(|lockbox| {
-            lockbox
-                .read()
-                .iter()
-                .flatten()
-                .cloned()
-                .collect::<SmallVec<[_; LOCKBOX_LEN]>>()
-        })
+        Iter {
+            should_remove: None::<fn(&Pointer<T, V>) -> bool>,
+            probe: Probe::new(self, Cursor(0)),
+            items: SmallVec::new()
+        }
     }
 
     fn extract_if<'a>(
         &'a self,
-        mut f: impl FnMut(&Self::Pointer) -> bool + 'a,
+        f: impl FnMut(&Self::Pointer) -> bool + 'a,
     ) -> impl Iterator<Item = Self::Pointer> + 'a {
-        self.table.iter().flat_map(move |lockbox| {
-            let mut extracted = SmallVec::<[Pointer<T, V>; LOCKBOX_LEN]>::new();
-            let mut operate = self.operate_and_purge();
-            todo!();
-            // for slot in &mut lockbox.write()[..] {
-            //     if let Some(arc) = slot.take_if(|a| f(Pointer::ref_cast(a))) {
-            //         let pointer = Pointer(arc);
-            //         operate.remove(&pointer);
-            //         extracted.push(pointer);
-            //     }
-            //     todo!("eager delete")
-            // }
-            extracted
-        })
+        Iter {
+            should_remove: Some(f),
+            probe: Probe::new(self, Cursor(0)),
+            items: SmallVec::new()
+        }
     }
 
     fn insert(&self, value: T) -> Self::Pointer {
         let mut operate = self.operate_and_purge();
-        let key = value.key();
-        let mut probe = self.probe(key);
-
-        while let Some(lockbox) = probe.next_lockbox() {
-            let mut guard = lockbox.write();
-            while let Some(offset) = probe.next_offset() {
-                let slot = &mut guard[offset];
-                if slot.as_ref().is_none_or(|p| p.key() == key) {
-                    let pointer = Pointer::new(value, &mut operate);
-                    operate.complete_insert(&pointer);
-                    if let Some(prev) = slot.replace(pointer.clone()) {
-                        let _ = operate.remove(&prev);
-                    }
-                    return pointer;
-                }
+        match self
+            .probe(value.key())
+            .entry_write(value.key(), &mut operate)
+        {
+            Entry::Occupied(OccupiedEntry { probe, guard, .. })
+            | Entry::Vacant(VacantEntry { probe, guard, .. }) => {
+                let (pointer, _removed) =
+                    probe.insert(&mut guard.assert_write(), &mut operate, value);
+                pointer
             }
         }
-
-        panic!("exceeded capacity")
     }
 
     fn remove(&self, value: &T) -> Option<Self::Pointer> {
@@ -186,47 +163,47 @@ where
         mut f: impl for<'a> FnMut(&'a T, &'a Self::Pointer) -> &'a T,
     ) -> Self::Pointer {
         let mut operate = self.operate_and_purge();
-        let key = value.key();
-        let mut probe = self.probe(key);
 
-        while let Some(lockbox) = probe.next_lockbox() {
-            let guard = lockbox.upgradable_read();
-            while let Some(offset) = probe.next_offset() {
-                let slot = &guard[offset];
-                match &slot {
-                    Some(existing) if existing.key() == key => {
-                        if operate.start_read(existing) == StartRead::Allow
-                            && std::ptr::eq(&**existing, f(&value, existing))
-                        {
-                            operate.complete_read(existing);
-                            return existing.clone();
-                        } else {
-                            let pointer = Pointer::new(value, &mut operate);
-                            {
-                                let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
-                                let _ = operate.remove(guard[offset].as_ref().unwrap());
-                                guard[offset] = Some(pointer.clone());
-                            }
-                            operate.complete_insert(&pointer);
+        // Try read first in happy case of no write required
+        let mut probe = match self
+            .probe(value.key())
+            .entry_read(value.key(), &mut operate)
+        {
+            Entry::Occupied(o) if std::ptr::addr_eq(f(&value, o.pointer()), o.get()) => {
+                return o.into_pointer();
+            }
 
-                            return pointer;
-                        }
-                    }
-                    Some(_) => {}
-                    None => {
-                        let pointer = Pointer::new(value, &mut operate);
-                        {
-                            let mut guard = RwLockUpgradableReadGuard::upgrade(guard);
-                            guard[offset] = Some(pointer.clone());
-                        }
-                        operate.complete_insert(&pointer);
-                        return pointer;
-                    }
-                }
+            Entry::Occupied(OccupiedEntry {
+                probe,
+                guard: LockboxGuard::Write(mut guard),
+                ..
+            })
+            | Entry::Vacant(VacantEntry {
+                probe,
+                guard: LockboxGuard::Write(mut guard),
+                ..
+            }) => {
+                let (pointer, _removed) = probe.insert(&mut guard, &mut operate, value);
+                return pointer;
+            }
+
+            Entry::Occupied(o) => o.probe,
+            Entry::Vacant(v) => v.probe,
+        };
+
+        probe.reset();
+        match probe.entry_write(value.key(), &mut operate) {
+            Entry::Occupied(o) if std::ptr::addr_eq(f(&value, o.pointer()), o.get()) => {
+                o.into_pointer()
+            }
+
+            Entry::Occupied(OccupiedEntry { probe, guard, .. })
+            | Entry::Vacant(VacantEntry { probe, guard, .. }) => {
+                let (pointer, _removed) =
+                    probe.insert(&mut guard.assert_write(), &mut operate, value);
+                pointer
             }
         }
-
-        panic!("exceeded capacity")
     }
 }
 
@@ -239,7 +216,7 @@ where
 {
     fn entry<'a, K>(
         &'a self,
-        key: &K,
+        key: &'a K,
     ) -> Entry<
         impl super::OccupiedEntry<'a, Value = T, Pointer = Self::Pointer> + use<'a, T, L, V, H, K>,
         impl super::VacantEntry<'a, Value = T, Pointer = Self::Pointer> + use<'a, T, L, V, H, K>,
@@ -248,62 +225,42 @@ where
         K: ?Sized + Hash + Equivalent<T::Key>,
     {
         let mut operate = self.operate_and_purge();
-        let mut probe = self.probe(key);
-
-        while let Some(lockbox) = probe.next_lockbox() {
-            let guard = lockbox.read();
-            while let Some(offset) = probe.next_offset() {
-                match &guard[offset] {
-                    Some(existing) if key.equivalent(existing.key()) => {
-                        match operate.start_read(existing) {
-                            StartRead::Allow => {
-                                operate.complete_read(existing);
-                                return Entry::Occupied(OccupiedEntry {
-                                    store: self,
-                                    probe,
-                                    guard: guard.into(),
-                                });
-                            }
-                            StartRead::Remove => {
-                                let existing = existing.clone();
-                                drop(guard);
-                                let guard = lockbox.write();
-                                return match &guard[offset] {
-                                    Some(p) if Arc::ptr_eq(&p.0, &existing.0) => todo!(),
-                                    Some(_) => Entry::Occupied(OccupiedEntry {
-                                        store: self,
-                                        probe,
-                                        guard: guard.into(),
-                                    }),
-                                    None => Entry::Vacant(VacantEntry {
-                                        store: self,
-                                        probe,
-                                        guard: guard.into(),
-                                    }),
-                                };
-                            }
-                        }
-                    }
-                    Some(_) => {}
-                    None => {
-                        return Entry::Vacant(VacantEntry {
-                            store: self,
-                            probe,
-                            guard: guard.into(),
-                        });
-                    }
-                }
-            }
-        }
-
-        panic!("exceeded capacity")
+        self.probe(key).entry_read(key, &mut operate)
     }
 
     fn or_insert_with<K>(&self, key: K, value: impl FnOnce(K) -> T) -> Self::Pointer
     where
-        K: Hash + Equivalent<<T as super::Value>::Key>,
+        K: Hash + Equivalent<T::Key>,
     {
-        todo!()
+        let mut operate = self.operate_and_purge();
+        let (probe, mut guard) = match self.probe(&key).entry_read(&key, &mut operate) {
+            Entry::Occupied(o) => return o.into_pointer(),
+
+            // the layer might've removed a value with the same key!
+            Entry::Vacant(VacantEntry {
+                probe,
+                guard: LockboxGuard::Write(guard),
+                ..
+            }) => (probe, guard),
+
+            Entry::Vacant(VacantEntry {
+                mut probe, guard, ..
+            }) => {
+                drop(guard);
+
+                // We need to reset the probe because the right slot for the
+                // current key could be behind the probe!
+                probe.reset();
+                match probe.entry_write(&key, &mut operate) {
+                    Entry::Occupied(o) => return o.into_pointer(),
+                    Entry::Vacant(VacantEntry { probe, guard, .. }) => {
+                        (probe, guard.assert_write())
+                    }
+                }
+            }
+        };
+
+        probe.insert_assert_vacant(&mut guard, &mut operate, value(key))
     }
 
     fn remove_key_if(
@@ -311,223 +268,11 @@ where
         key: &(impl ?Sized + Hash + Equivalent<T::Key>),
         mut f: impl FnMut(&Self::Pointer) -> bool,
     ) -> Result<Option<Self::Pointer>, Self::Pointer> {
-        todo!()
-    }
-}
-
-pub struct OccupiedEntry<'a, T, L, V, H = DefaultHashBuilder> {
-    store: &'a FixedCapSyncHashStore<T, L, V, H>,
-    probe: Probe<'a, T, V>,
-    guard: LockboxGuard<'a, T, V>,
-}
-
-impl<'a, T, L, V, H> crate::store::hash::OccupiedEntry<'a> for OccupiedEntry<'a, T, L, V, H>
-where
-    T: super::Value + Send + Sync + 'static,
-    L: Layer<Pointer<T, V>, Value = V>,
-    V: Send + Sync + 'static,
-    H: BuildHasher,
-{
-    type Value = T;
-    type Pointer = Pointer<T, V>;
-    type VacantEntry = VacantEntry<'a, T, L, V, H>;
-
-    fn get(&self) -> &Self::Value {
-        &**self.pointer()
-    }
-
-    fn pointer(&self) -> &Self::Pointer {
-        self.guard[self.probe.offset()].as_ref().unwrap()
-    }
-
-    fn into_pointer(self) -> Self::Pointer {
-        self.pointer().clone()
-    }
-
-    fn try_remove(self) -> Result<Self::Pointer, Entry<Self, Self::VacantEntry>> {
-        // XX match on lock guard type
-
-        let expected = self.pointer().clone();
-        drop(self.guard);
-
-        let mut guard = self.probe.lockbox().write();
-        match &mut guard[self.probe.offset()] {
-            Some(existing) if Arc::ptr_eq(&expected.0, &existing.0) => {
-                let mut operate = self.store.layer.operate();
-                guard[self.probe.offset()] = None;
-                match operate.remove(&expected) {
-                    Remove::Allow => todo!(),
-                    Remove::Hide => todo!(),
-                }
-                Ok(expected)
-            }
-            Some(existing) => {
-                let mut operate = self.store.layer.operate();
-                match operate.start_read(existing) {
-                    StartRead::Allow => {
-                        operate.complete_read(existing);
-                        Err(Entry::Occupied(OccupiedEntry {
-                            store: self.store,
-                            probe: self.probe,
-                            guard: guard.into(),
-                        }))
-                    }
-                    StartRead::Remove => {
-                        todo!("eager delete")
-                    }
-                }
-            }
-            None => Err(Entry::Vacant(VacantEntry {
-                store: self.store,
-                probe: self.probe,
-                guard: guard.into(),
-            })),
-        }
-    }
-
-    fn insert(self, value: Self::Value) -> Self::Pointer {
-        drop(self.guard);
-
-        let mut operate = self.store.layer.operate();
-        let pointer = Pointer::new(value, &mut operate);
-
-        let mut guard = self.probe.lockbox().write();
-        if let Some(existing) = guard[self.probe.offset()].replace(pointer.clone()) {
-            let _ = operate.remove(&existing);
-        }
-        operate.complete_insert(&pointer);
-
-        pointer
-    }
-
-    fn remove_key(self) -> Option<Self::Pointer> {
-        drop(self.guard);
-
-        let mut guard = self.probe.lockbox().write();
-        let mut operate = self.store.layer.operate();
-        let pointer = guard[self.probe.offset()].take()?;
-
-        let can_see = operate.remove(&pointer) == Remove::Allow;
-        todo!("eager delete");
-
-        if can_see { Some(pointer) } else { None }
-    }
-
-    fn try_insert(
-        self,
-        value: Self::Value,
-    ) -> Result<Self::Pointer, (Self::Value, Entry<Self, Self::VacantEntry>)> {
-        let (mut guard, expected) = match &self.guard {
-            LockboxGuard::Read(_) => {
-                let existing = self.guard[self.probe.offset()].clone().unwrap();
-                drop(self.guard);
-                (self.probe.lockbox().write(), existing)
-            }
-            LockboxGuard::Write(_) => return Ok(self.insert(value)),
-        };
-
-        match &mut guard[self.probe.offset()] {
-            Some(p) if Arc::ptr_eq(&expected.0, &p.0) => {
-                let mut operate = self.store.layer.operate();
-                let pointer = Pointer::new(value, &mut operate);
-                guard[self.probe.offset()] = Some(pointer.clone());
-                Ok(pointer)
-            }
-            Some(existing) => {
-                let mut operate = self.store.layer.operate();
-                match operate.start_read(existing) {
-                    StartRead::Allow => {
-                        operate.complete_read(existing);
-                        Err((
-                            value,
-                            Entry::Occupied(OccupiedEntry {
-                                store: self.store,
-                                probe: self.probe,
-                                guard: guard.into(),
-                            }),
-                        ))
-                    }
-                    StartRead::Remove => {
-                        todo!("eager delete")
-                    }
-                }
-            }
-            None => Err((
-                value,
-                Entry::Vacant(VacantEntry {
-                    store: self.store,
-                    probe: self.probe,
-                    guard: guard.into(),
-                }),
-            )),
-        }
-    }
-}
-
-pub struct VacantEntry<'a, T, L, V, H = DefaultHashBuilder> {
-    store: &'a FixedCapSyncHashStore<T, L, V, H>,
-    probe: Probe<'a, T, V>,
-    guard: LockboxGuard<'a, T, V>,
-}
-
-impl<'a, T, L, V, H> crate::store::hash::VacantEntry<'a> for VacantEntry<'a, T, L, V, H>
-where
-    T: super::Value + Send + Sync + 'static,
-    L: Layer<Pointer<T, V>, Value = V>,
-    V: Send + Sync + 'static,
-    H: BuildHasher,
-{
-    type Value = T;
-    type Pointer = Pointer<T, V>;
-    type OccupiedEntry = OccupiedEntry<'a, T, L, V, H>;
-
-    fn insert(self, value: Self::Value) -> Self::Pointer {
-        let mut guard = LockboxGuard::into_write(self.guard);
-        let mut operate = self.store.layer.operate();
-        let pointer = Pointer::new(value, &mut operate);
-        if let Some(existing) = guard[self.probe.offset()].replace(pointer.clone()) {
-            let _ = operate.remove(&existing);
-        }
-        operate.complete_insert(&pointer);
-        pointer
-    }
-
-    fn try_insert(
-        self,
-        value: Self::Value,
-    ) -> Result<Self::Pointer, (Self::Value, Self::OccupiedEntry)> {
-        match &self.guard {
-            LockboxGuard::Read(_) => {
-                drop(self.guard);
-
-                let mut operate = self.store.layer.operate();
-                let mut guard = self.probe.lockbox().write();
-                match &guard[self.probe.offset()] {
-                    Some(pointer) => match operate.start_read(pointer) {
-                        StartRead::Allow => {
-                            operate.complete_read(pointer);
-                            Err((
-                                value,
-                                OccupiedEntry {
-                                    store: self.store,
-                                    probe: self.probe,
-                                    guard: guard.into(),
-                                },
-                            ))
-                        }
-                        StartRead::Remove => {
-                            todo!()
-                        }
-                    },
-                    None => {
-                        let pointer = Pointer::new(value, &mut operate);
-                        guard[self.probe.offset()] = Some(pointer.clone());
-                        operate.complete_insert(&pointer);
-                        Ok(pointer)
-                    }
-                }
-            }
-            LockboxGuard::Write(_) => Ok(self.insert(value)),
+        let mut operate = self.operate_and_purge();
+        match self.probe(key).entry_write(key, &mut operate) {
+            Entry::Occupied(o) if f(o.pointer()) => Ok(Some(o.remove_write(&mut operate))),
+            Entry::Occupied(o) => Err(o.into_pointer()),
+            Entry::Vacant(_) => Ok(None),
         }
     }
 }
@@ -553,24 +298,24 @@ where
                 let key = pointer.key();
                 let mut probe = self.0.probe(key);
 
-                while let Some(lockbox) = probe.next_lockbox() {
-                    let mut guard = lockbox.write();
-                    while let Some(offset) = probe.next_offset() {
-                        match &guard[offset] {
-                            Some(p) if Arc::ptr_eq(&p.0, &pointer.0) => {
-                                guard[offset] = None;
-
-                                // happy case
-                                if guard.get(offset + 1).is_some_and(|slot| slot.is_none()) {
-                                    return Ok(());
-                                } else {
-                                    unimplemented!("eager delete")
-                                }
-                            }
-                            Some(_) => {}
-                            None => return Err(()),
-                        }
+                let mut prev = probe.current;
+                let mut guard = None;
+                while let Some(cursor) = probe.next() {
+                    if cursor.index() != prev.index() {
+                        guard = None;
                     }
+
+                    let guard_ref = guard.get_or_insert_with(|| probe.lockbox().write());
+                    match &guard_ref[cursor.offset()] {
+                        Some(p) if Arc::ptr_eq(&p.0, &pointer.0) => {
+                            let _ = probe.vacate(guard.unwrap());
+                            return Ok(());
+                        }
+                        Some(_) => {}
+                        None => return Err({}),
+                    }
+
+                    prev = cursor;
                 }
 
                 panic!("exceeded capacity")
@@ -582,137 +327,688 @@ where
         operate
     }
 
-    fn probe<'a, K: ?Sized + Hash>(&'a self, key: &K) -> Probe<'a, T, V> {
+    fn cursor(&self, key: &(impl ?Sized + Hash)) -> Cursor {
         let hash = self.hasher.hash_one(key) as usize;
 
-        let start_index = hash / LOCKBOX_LEN;
-        debug_assert!(LOCKBOX_LEN <= u8::MAX.into());
-        let start_offset = (hash % LOCKBOX_LEN) as u8;
-
-        Probe {
-            table: &self.table,
-            start_index,
-            start_offset,
-            exhausted_indexes: false,
-            index: start_index,
-            offset: start_offset,
-        }
+        let index = (hash >> OFFSET_BITS) & self.mask;
+        let offset = hash & OFFSET_MASK;
+        // XX: 1/16 bias towards the first slot to avoid division, reduce
+        // multi-lockbox lookups
+        Cursor::new(
+            index,
+            if offset >= LOCKBOX_LEN {
+                (offset - LOCKBOX_LEN) as u8
+            } else {
+                offset as u8
+            },
+        )
     }
 
-    fn clean_up_delete(
-        &self,
-        probe: &mut Probe<'_, T, V>,
-        guard: &mut RwLockWriteGuard<'_, LockboxArray<T, V>>,
-    ) {
-        // happy case, no clean up required or in the same lockbox
-        let mut hole_offset = probe.offset();
-        let mut hole_index = probe.index();
-        debug_assert!(guard[hole_offset].is_none());
+    fn probe<'a, K: ?Sized + Hash>(&'a self, key: &K) -> Probe<'a, T, L, V, H> {
+        let start = self.cursor(key);
+        Probe::new(self, start)
+    }
+}
 
-        while let Some(offset) = probe.next_offset() {
-            match &guard[offset] {
-                Some(pointer) => {
-                    let candidate_probe = self.probe(pointer.key());
-                    if candidate_probe.index() == probe.index()
-                        && (hole_offset..offset).contains(&candidate_probe.offset())
-                    {
-                        guard[hole_offset] = guard[offset].take();
-                        hole_offset = offset;
-                    }
-                }
-                None => return,
-            }
-        }
+struct Iter<'a, F, T, L, V, H> {
+    should_remove: Option<F>,
+    probe: Probe<'a, T, L, V, H>,
+    items: SmallVec<[Pointer<T, V>; LOCKBOX_LEN]>,
+}
 
-        // slow case
-        let mut guards = SmallVec::<[RwLockWriteGuard<LockboxArray<T, V>>; 8]>::new();
-        while let Some(lockbox) = probe.next_lockbox() {
-            let mut guard = lockbox.write();
-            while let Some(offset) = probe.next_offset() {
-                match &guard[offset] {
-                    Some(pointer) => {
-                        let candidate_probe = self.probe(pointer.key());
-                        // if
-                        // if candidate_probe.index() == probe.index()
-                        //     && (hole_offset..offset).contains(&candidate_probe.offset())
-                        // {
-                        //     guard[hole_offset] = guard[offset].take();
-                        //     hole_offset = offset;
-                        // }
-                    }
-                    None => return,
-                }
+impl<F, T, L, V, H> Iterator for Iter<'_, F, T, L, V, H>
+where
+    F: FnMut(&Pointer<T, V>) -> bool,
+    T: super::Value + Send + Sync + 'static,
+    L: Layer<Pointer<T, V>, Value = V>,
+    V: Send + Sync + 'static,
+    H: BuildHasher,
+{
+    type Item = Pointer<T, V>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(item) = self.items.pop() {
+                return Some(item);
             }
 
-            guards.push(guard);
+            let start = self.probe.next()?;
+            let mut operate = self.probe.store.layer.operate();
+            let mut guard = self.probe.lockbox().write();
+            loop {
+                if let Some(pointer) = &guard[self.probe.offset()] {
+                    match operate.start_read(pointer) {
+                        StartRead::Allow => {
+                            if let Some(should_remove) = self.should_remove.as_mut() {
+                                if should_remove(pointer) {
+                                    let _ = operate.remove(pointer);
+                                    self.items.push(pointer.clone());
+                                    // XX we need to inline the loop here ourselves :/
+                                    guard = self.probe.vacate(guard);
+                                    todo!()
+                                }
+                            } else {
+                                // XX no need to call complete_read() on all items?
+                                self.items.push(pointer.clone());
+                            }
+                        }
+                        StartRead::Remove => todo!(),
+                    }
+                }
+
+                if self.probe.next().is_none_or(|n| n.index() != start.index()) {
+                    break;
+                }
+            }
         }
     }
 }
 
-const CACHE_ROW: usize = mem::align_of::<CachePadded<()>>();
-const LOCKBOX_LEN: usize =
-    (CACHE_ROW - mem::size_of::<RawRwLock>()) / mem::size_of::<Option<Arc<()>>>();
-type LockboxArray<T, V> = [Option<Pointer<T, V>>; LOCKBOX_LEN];
+pub struct OccupiedEntry<'a, 'k, K: ?Sized, T, L, V, H = DefaultHashBuilder> {
+    probe: Probe<'a, T, L, V, H>,
+    key: &'k K,
+    guard: LockboxGuard<'a, T, V>,
+}
 
+impl<'a, 'k, K, T, L, V, H> crate::store::hash::OccupiedEntry<'k>
+    for OccupiedEntry<'a, 'k, K, T, L, V, H>
+where
+    'a: 'k,
+    K: ?Sized + Equivalent<T::Key>,
+    T: super::Value + Send + Sync + 'static,
+    L: Layer<Pointer<T, V>, Value = V>,
+    V: Send + Sync + 'static,
+    H: BuildHasher,
+{
+    type Value = T;
+    type Pointer = Pointer<T, V>;
+    type VacantEntry = VacantEntry<'a, 'k, K, T, L, V, H>;
+
+    fn get(&self) -> &Self::Value {
+        &**self.pointer()
+    }
+
+    fn pointer(&self) -> &Self::Pointer {
+        self.guard[self.probe.offset()].as_ref().unwrap()
+    }
+
+    fn into_pointer(self) -> Self::Pointer {
+        self.pointer().clone()
+    }
+
+    fn try_remove(mut self) -> Result<Self::Pointer, Entry<Self, Self::VacantEntry>> {
+        match &self.guard {
+            LockboxGuard::Read(_) => {
+                let existing = self.pointer().clone();
+                drop(self.guard);
+
+                // Happy case: the slot still has the same
+                // pointer (no A B A problem because we still
+                // hold a ref in existing!)
+                let guard = self.probe.lockbox().write();
+                let mut operate = self.probe.store.layer.operate();
+                if guard[self.probe.offset()]
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(&p.0, &existing.0))
+                {
+                    let _ = self.probe.vacate(guard);
+                    let _ = operate.remove(&existing);
+                    return Ok(existing);
+                }
+
+                // We need to reset the probe because the right slot for the
+                // current key could be behind the probe!
+                let guard = if self.probe.start.index() == self.probe.current.index() {
+                    guard
+                } else {
+                    drop(guard);
+                    self.probe.store.table[self.probe.start.index()].write()
+                };
+                self.probe.reset();
+
+                match self
+                    .probe
+                    .entry_write_with_guard(self.key, &mut operate, guard)
+                {
+                    Entry::Occupied(o) if Arc::ptr_eq(&o.pointer().0, &existing.0) => {
+                        Ok(o.remove_write(&mut operate))
+                    }
+                    entry => Err(entry),
+                }
+            }
+
+            LockboxGuard::Write(_) => {
+                let mut operate = self.probe.store.layer.operate();
+                Ok(self.remove_write(&mut operate))
+            }
+        }
+    }
+
+    fn try_insert(
+        mut self,
+        value: Self::Value,
+    ) -> Result<Self::Pointer, (Self::Value, Entry<Self, Self::VacantEntry>)> {
+        match &self.guard {
+            LockboxGuard::Read(_) => {
+                let existing = self.pointer().clone();
+                drop(self.guard);
+
+                // Happy case: the slot still has the same
+                // pointer (no A B A problem because we still
+                // hold a ref in existing!)
+                let mut guard = self.probe.lockbox().write();
+                let mut operate = self.probe.store.layer.operate();
+                if guard[self.probe.offset()]
+                    .as_ref()
+                    .is_some_and(|p| Arc::ptr_eq(&p.0, &existing.0))
+                {
+                    let pointer = Pointer::new(value, &mut operate);
+                    let removed = guard[self.probe.offset()].replace(pointer.clone());
+                    let _ = operate.remove(&removed.unwrap());
+                    operate.complete_insert(&pointer);
+                    return Ok(pointer);
+                }
+
+                // We need to reset the probe because the right slot for the
+                // current key could be behind the probe!
+                let guard = if self.probe.start.index() == self.probe.current.index() {
+                    guard
+                } else {
+                    drop(guard);
+                    self.probe.store.table[self.probe.start.index()].write()
+                };
+                self.probe.reset();
+
+                match self
+                    .probe
+                    .entry_write_with_guard(self.key, &mut operate, guard)
+                {
+                    Entry::Occupied(o) if Arc::ptr_eq(&o.pointer().0, &existing.0) => {
+                        Ok(o.insert_write(value))
+                    }
+                    entry => Err((value, entry)),
+                }
+            }
+
+            LockboxGuard::Write(_) => Ok(self.insert_write(value)),
+        }
+    }
+}
+
+impl<'a, 'k, K, T, L, V, H> OccupiedEntry<'a, 'k, K, T, L, V, H>
+where
+    'a: 'k,
+    K: ?Sized + Equivalent<T::Key>,
+    T: super::Value + Send + Sync + 'static,
+    L: Layer<Pointer<T, V>, Value = V>,
+    V: Send + Sync + 'static,
+    H: BuildHasher,
+{
+    fn insert_write(self, value: T) -> Pointer<T, V> {
+        let mut guard = self.guard.assert_write();
+        let mut operate = self.probe.store.layer.operate();
+        self.probe
+            .insert_assert_vacant(&mut guard, &mut operate, value)
+    }
+
+    fn remove_write(mut self, operate: &mut impl Operate<Pointer<T, V>>) -> Pointer<T, V> {
+        let removed = self.pointer().clone();
+        let _ = self.probe.vacate(self.guard.assert_write());
+        let _ = operate.remove(&removed);
+        removed
+    }
+}
+
+pub struct VacantEntry<'a, 'k, K: ?Sized, T, L, V, H = DefaultHashBuilder> {
+    probe: Probe<'a, T, L, V, H>,
+    key: &'k K,
+    guard: LockboxGuard<'a, T, V>,
+}
+
+impl<'a, 'k, K, T, L, V, H> crate::store::hash::VacantEntry<'k>
+    for VacantEntry<'a, 'k, K, T, L, V, H>
+where
+    'a: 'k,
+    K: ?Sized + Equivalent<T::Key>,
+    T: super::Value + Send + Sync + 'static,
+    L: Layer<Pointer<T, V>, Value = V>,
+    V: Send + Sync + 'static,
+    H: BuildHasher,
+{
+    type Value = T;
+    type Pointer = Pointer<T, V>;
+    type OccupiedEntry = OccupiedEntry<'a, 'k, K, T, L, V, H>;
+
+    fn try_insert(
+        mut self,
+        value: Self::Value,
+    ) -> Result<Self::Pointer, (Self::Value, Self::OccupiedEntry)> {
+        debug_assert!(self.key.equivalent(value.key()));
+
+        let mut operate = self.probe.store.layer.operate();
+        let (mut guard, probe) = match self.guard {
+            LockboxGuard::Read(guard) => {
+                drop(guard);
+
+                // We need to reset the probe because the right slot for the
+                // current key could be behind the probe!
+                self.probe.reset();
+                match self.probe.entry_write(self.key, &mut operate) {
+                    Entry::Occupied(o) => return Err((value, o)),
+                    Entry::Vacant(v) => (v.guard.assert_write(), v.probe),
+                }
+            }
+
+            LockboxGuard::Write(guard) => (guard, self.probe),
+        };
+
+        Ok(probe.insert_assert_vacant(&mut guard, &mut operate, value))
+    }
+}
+
+const CACHE_ROW: usize = mem::align_of::<CachePadded<()>>();
+const LOCK_SIZE: usize = mem::size_of::<RawRwLock>();
+const ITEM_SIZE: usize = mem::size_of::<Option<Arc<()>>>();
+const LOCKBOX_LEN: usize = (CACHE_ROW - LOCK_SIZE) / ITEM_SIZE;
+
+const OFFSET_BITS: u32 = usize::BITS - LOCKBOX_LEN.leading_zeros();
+const OFFSET_MASK: usize = (1usize << OFFSET_BITS) - 1;
+
+type LockboxArray<T, V> = [Option<Pointer<T, V>>; LOCKBOX_LEN];
 type Lockbox<T, V> = CachePadded<RwLock<LockboxArray<T, V>>>;
+
+const _: () = {
+    assert!(OFFSET_BITS <= u8::BITS);
+    assert!(mem::size_of::<Lockbox<(), ()>>() == CACHE_ROW);
+};
 
 const fn empty_lockbox<T, V>() -> Lockbox<T, V> {
     CachePadded::new(RwLock::new([const { None }; LOCKBOX_LEN]))
 }
 
-struct Probe<'a, T, V> {
-    table: &'a [Lockbox<T, V>],
-    start_index: usize,
-    start_offset: u8,
-    exhausted_indexes: bool,
-    index: usize,
-    offset: u8,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Cursor(usize);
 
-impl<'a, T, V> Probe<'a, T, V> {
-    fn index(&self) -> usize {
-        self.index
+impl Cursor {
+    pub fn new(index: usize, offset: u8) -> Self {
+        debug_assert_eq!(index, (index << OFFSET_BITS) >> OFFSET_BITS);
+        debug_assert_eq!(usize::from(offset) & !OFFSET_MASK, 0);
+
+        Self(index << u8::BITS & usize::from(offset))
     }
 
-    fn lockbox(&self) -> &'a Lockbox<T, V> {
-        &self.table[self.index]
+    pub fn offset(self) -> usize {
+        self.0 & OFFSET_MASK
     }
 
-    fn offset(&self) -> usize {
-        self.offset.into()
+    pub fn with_offset(self, offset: usize) -> Self {
+        debug_assert!(offset <= LOCKBOX_LEN);
+        Self::new(self.index(), offset as u8)
     }
 
-    fn next_index(&mut self) -> Option<usize> {
-        if self.exhausted_indexes {
-            None
+    pub fn index(self) -> usize {
+        self.0 >> OFFSET_BITS
+    }
+
+    pub fn is_wrapping_between(self, exclusive_lower: Cursor, exclusive_upper: Cursor) -> bool {
+        debug_assert_ne!(exclusive_lower, exclusive_upper);
+
+        if exclusive_lower < exclusive_upper {
+            exclusive_lower < self && self < exclusive_upper
         } else {
-            let result = next_wrapping(&mut self.index, self.table.len());
-            self.exhausted_indexes = result == self.start_index;
-            Some(result)
+            exclusive_lower < self || self < exclusive_upper
         }
     }
 
-    fn next_lockbox(&mut self) -> Option<&'a Lockbox<T, V>> {
-        self.next_index().map(|i| &self.table[i])
-    }
-
-    fn next_offset(&mut self) -> Option<usize> {
-        if self.exhausted_indexes && self.offset >= self.start_offset {
-            None
+    pub fn next(self, table_len: usize) -> Self {
+        let next_offset = self.offset() + 1;
+        if next_offset >= LOCKBOX_LEN {
+            let next_index = self.index() + 1;
+            if next_index >= table_len {
+                Self::new(0, 0)
+            } else {
+                Self::new(next_index, 0)
+            }
         } else {
-            Some(next_wrapping(&mut self.offset, LOCKBOX_LEN as u8).into())
+            self.with_offset(next_offset)
         }
     }
 }
 
-fn next_wrapping<N: From<u8> + Ord + AddAssign + Copy>(index: &mut N, cap: N) -> N {
-    if *index >= cap {
-        *index = 1u8.into();
-        0u8.into()
-    } else {
-        let result = *index;
-        *index += 1.into();
-        result
+struct Probe<'a, T, L, V, H> {
+    store: &'a FixedCapSyncHashStore<T, L, V, H>,
+    start: Cursor,
+    current: Cursor,
+    passed_start: bool,
+}
+
+impl<T, L, V, H> Clone for Probe<'_, T, L, V, H> {
+    fn clone(&self) -> Self {
+        Self { ..*self }
+    }
+}
+
+impl<'a, T, L, V, H> Probe<'a, T, L, V, H>
+where
+    T: super::Value + Send + Sync + 'static,
+    L: Layer<Pointer<T, V>, Value = V>,
+    V: Send + Sync + 'static,
+    H: BuildHasher,
+{
+    pub fn new(store: &'a FixedCapSyncHashStore<T, L, V, H>, start: Cursor) -> Self {
+        Self {
+            store,
+            start,
+            current: start,
+            passed_start: false,
+        }
+    }
+
+    pub fn lockbox(&self) -> &'a Lockbox<T, V> {
+        &self.store.table[self.current.index()]
+    }
+
+    pub fn offset(&self) -> usize {
+        self.current.offset()
+    }
+
+    pub fn next(&mut self) -> Option<Cursor> {
+        if self.passed_start {
+            let next = self.current.next(self.store.table.len());
+            if next == self.start {
+                None
+            } else {
+                self.current = next;
+                Some(next)
+            }
+        } else {
+            self.passed_start = true;
+            debug_assert_eq!(self.current, self.start);
+            Some(self.current)
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.current = self.start;
+        self.passed_start = false;
+    }
+
+    pub fn distance(&self) -> usize {
+        let diff = self.current.0.abs_diff(self.start.0);
+        if self.current >= self.start {
+            diff
+        } else {
+            (self.store.table.len() << OFFSET_BITS) - diff
+        }
+    }
+
+    #[inline(always)]
+    pub fn vacate(
+        &mut self,
+        mut guard: RwLockWriteGuard<'a, LockboxArray<T, V>>,
+    ) -> RwLockWriteGuard<'a, LockboxArray<T, V>> {
+        debug_assert!(guard[self.offset()].is_some());
+        guard[self.offset()] = None;
+
+        // short circuit the happy case where next offset is a hole
+        if guard
+            .get(self.offset() + 1)
+            .is_some_and(|candidate| candidate.is_none())
+        {
+            guard
+        } else {
+            self.vacate_slow(guard)
+        }
+    }
+
+    #[inline(never)]
+    fn vacate_slow(
+        &mut self,
+        guard: RwLockWriteGuard<'a, LockboxArray<T, V>>,
+    ) -> RwLockWriteGuard<'a, LockboxArray<T, V>> {
+        let mut guards: SmallVec<[_; 7]> = smallvec![guard];
+        let mut candidate_guard_index = 0;
+        let mut hole = self.current;
+        let mut prev = self.current;
+
+        while let Some(cursor) = self.next() {
+            if cursor.index() != prev.index() {
+                if guards.len() < self.store.table.len() {
+                    guards.push(self.lockbox().write());
+                    candidate_guard_index = guards.len() - 1;
+                } else {
+                    // we've wrapped back around to the first lockbox we looked at!
+                    candidate_guard_index = 0;
+                }
+            }
+
+            let Some(candidate) = &guards[candidate_guard_index][cursor.offset()] else {
+                // We've reached an existing hole, we can stop vacating.
+                // Point probe back to the hole we vacated.
+                self.current = hole;
+
+                // XX is the drop order ok?
+                return guards
+                    // Drain ensures we drop all the other guards no
+                    // matter where we find the hole guard (the hole
+                    // could be in the first slot of the next lockbox)
+                    .drain(..)
+                    .next()
+                    .unwrap();
+            };
+
+            let candidate_origin = self.store.cursor(candidate.key());
+            if candidate_origin.is_wrapping_between(hole, cursor) {
+                if candidate_guard_index == 0 {
+                    debug_assert_eq!(hole.index(), self.current.index());
+                    guards[0].swap(hole.offset(), cursor.offset());
+                } else {
+                    let [hole_guard, guard] =
+                        guards.get_disjoint_mut([0, candidate_guard_index]).unwrap();
+                    hole_guard[hole.offset()] = guard[cursor.offset()].take();
+                    hole = cursor;
+
+                    // Drop guards we no longer need!
+                    let num_guards_to_drop = candidate_guard_index;
+                    guards.drain(..num_guards_to_drop);
+                    candidate_guard_index = 0;
+                }
+            }
+
+            prev = cursor;
+        }
+
+        panic!("capacity exceeded")
+    }
+
+    pub fn entry_read<'k, K>(
+        mut self,
+        key: &'k K,
+        operate: &mut impl Operate<Pointer<T, V>>,
+    ) -> Entry<OccupiedEntry<'a, 'k, K, T, L, V, H>, VacantEntry<'a, 'k, K, T, L, V, H>>
+    where
+        K: ?Sized + Hash + Equivalent<T::Key>,
+    {
+        let mut prev = self.current;
+        let mut guard: LockboxGuard<T, V> = self.lockbox().read().into();
+
+        while let Some(cursor) = self.next() {
+            if cursor.index() != prev.index() {
+                drop(guard);
+                guard = self.lockbox().read().into();
+            }
+
+            match &guard[cursor.offset()] {
+                Some(existing) if key.equivalent(existing.key()) => {
+                    match operate.start_read(existing) {
+                        StartRead::Allow => {
+                            operate.complete_read(existing);
+                            return Entry::Occupied(OccupiedEntry {
+                                probe: self,
+                                key,
+                                guard,
+                            });
+                        }
+
+                        StartRead::Remove => match guard {
+                            LockboxGuard::Read(_) => {
+                                let existing = existing.clone();
+                                drop(guard);
+                                let mut write = self.lockbox().write();
+
+                                // Happy case: the slot still has the same
+                                // pointer (no A B A problem because we still
+                                // hold a ref in existing!)
+                                if write[cursor.offset()]
+                                    .as_ref()
+                                    .is_some_and(|p| Arc::ptr_eq(&p.0, &existing.0))
+                                {
+                                    let _ = operate.remove(&existing);
+                                    write = self.vacate(write);
+                                    return Entry::Vacant(VacantEntry {
+                                        probe: self,
+                                        key,
+                                        guard: write.into(),
+                                    });
+                                }
+
+                                // Otherwise, the "right" slot for this key
+                                // may be behind the probe. We'll need to
+                                // start over.
+                                self.reset();
+                                guard = write.into();
+                            }
+
+                            LockboxGuard::Write(_) => {
+                                let _ = operate.remove(existing);
+                                let guard = self.vacate(guard.assert_write());
+                                return Entry::Vacant(VacantEntry {
+                                    probe: self,
+                                    key,
+                                    guard: guard.into(),
+                                });
+                            }
+                        },
+                    }
+                }
+
+                Some(_) => {}
+
+                None => {
+                    return Entry::Vacant(VacantEntry {
+                        probe: self,
+                        key,
+                        guard,
+                    });
+                }
+            }
+
+            prev = cursor;
+        }
+
+        panic!("capacity exceeded")
+    }
+
+    pub fn entry_write<'k, K>(
+        self,
+        key: &'k K,
+        operate: &mut impl Operate<Pointer<T, V>>,
+    ) -> Entry<OccupiedEntry<'a, 'k, K, T, L, V, H>, VacantEntry<'a, 'k, K, T, L, V, H>>
+    where
+        K: ?Sized + Equivalent<T::Key>,
+    {
+        let guard = self.lockbox().write();
+        self.entry_write_with_guard(key, operate, guard)
+    }
+
+    pub fn entry_write_with_guard<'k, K>(
+        mut self,
+        key: &'k K,
+        operate: &mut impl Operate<Pointer<T, V>>,
+        mut guard: RwLockWriteGuard<'a, LockboxArray<T, V>>,
+    ) -> Entry<OccupiedEntry<'a, 'k, K, T, L, V, H>, VacantEntry<'a, 'k, K, T, L, V, H>>
+    where
+        K: ?Sized + Equivalent<T::Key>,
+    {
+        let mut prev = self.current;
+
+        while let Some(cursor) = self.next() {
+            if cursor.index() != prev.index() {
+                drop(guard);
+                guard = self.lockbox().write();
+            }
+
+            match &guard[cursor.offset()] {
+                Some(existing) if key.equivalent(existing.key()) => {
+                    match operate.start_read(existing) {
+                        StartRead::Allow => {
+                            operate.complete_read(existing);
+                            return Entry::Occupied(OccupiedEntry {
+                                probe: self,
+                                key,
+                                guard: guard.into(),
+                            });
+                        }
+
+                        StartRead::Remove => {
+                            let _ = operate.remove(existing);
+                            let guard = self.vacate(guard);
+                            return Entry::Vacant(VacantEntry {
+                                probe: self,
+                                key,
+                                guard: guard.into(),
+                            });
+                        }
+                    }
+                }
+
+                Some(_) => {}
+
+                None => {
+                    return Entry::Vacant(VacantEntry {
+                        probe: self,
+                        key,
+                        guard: guard.into(),
+                    });
+                }
+            }
+
+            prev = cursor;
+        }
+
+        panic!("capacity exceeded")
+    }
+
+    pub fn insert(
+        &self,
+        guard: &mut RwLockWriteGuard<'_, LockboxArray<T, V>>,
+        operate: &mut impl Operate<Pointer<T, V>>,
+        value: T,
+    ) -> (Pointer<T, V>, Option<Pointer<T, V>>) {
+        debug_assert!(std::ptr::addr_eq(
+            RwLockWriteGuard::rwlock(guard),
+            &self.store.table[self.current.index()]
+        ));
+
+        let pointer = Pointer::new(value, operate);
+        let removed = guard[self.offset()].replace(pointer.clone());
+        removed.as_ref().inspect(|r| {
+            let _ = operate.remove(r);
+        });
+        operate.complete_insert(&pointer);
+
+        (pointer, removed)
+    }
+
+    pub fn insert_assert_vacant(
+        &self,
+        guard: &mut RwLockWriteGuard<'_, LockboxArray<T, V>>,
+        operate: &mut impl Operate<Pointer<T, V>>,
+        value: T,
+    ) -> Pointer<T, V> {
+        let (pointer, removed) = self.insert(guard, operate, value);
+        debug_assert!(removed.is_none());
+        pointer
     }
 }
 
@@ -745,13 +1041,9 @@ impl<'a, T, V> From<RwLockWriteGuard<'a, LockboxArray<T, V>>> for LockboxGuard<'
 }
 
 impl<'a, T, V> LockboxGuard<'a, T, V> {
-    fn into_write(guard: Self) -> RwLockWriteGuard<'a, LockboxArray<T, V>> {
-        match guard {
-            LockboxGuard::Read(read) => {
-                let lockbox = RwLockReadGuard::rwlock(&read);
-                drop(read);
-                lockbox.write()
-            }
+    fn assert_write(self) -> RwLockWriteGuard<'a, LockboxArray<T, V>> {
+        match self {
+            LockboxGuard::Read(_) => unreachable!(),
             LockboxGuard::Write(write) => write,
         }
     }

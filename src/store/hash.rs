@@ -15,7 +15,7 @@ pub trait Store<T: Value>: super::Store<T> {
 
     fn entry<'a, K>(
         &'a self,
-        key: &K,
+        key: &'a K,
     ) -> Entry<
         impl OccupiedEntry<'a, Value = T, Pointer = Self::Pointer> + use<'a, Self, T, K>,
         impl VacantEntry<'a, Value = T, Pointer = Self::Pointer> + use<'a, Self, T, K>,
@@ -39,20 +39,19 @@ pub trait Store<T: Value>: super::Store<T> {
         std::array::from_fn(|i| self.get(keys[i]))
     }
 
-    #[inline]
     fn or_insert_with<K>(&self, key: K, value: impl FnOnce(K) -> T) -> Self::Pointer
     where
-        K: Hash + Equivalent<T::Key>,
-    {
-        let entry = self.entry(&key);
-        match entry {
-            Entry::Occupied(o) => o.into_pointer(),
-            Entry::Vacant(v) => match v.try_insert(value(key)) {
-                Ok(p) => p,
-                Err((_v, o)) => o.into_pointer(),
-            },
-        }
-    }
+        K: Hash + Equivalent<T::Key>;
+    // {
+    //     let entry = self.entry(&key);
+    //     match entry {
+    //         Entry::Occupied(o) => o.into_pointer(),
+    //         Entry::Vacant(v) => match v.try_insert(value(key)) {
+    //             Ok(p) => p,
+    //             Err((_v, o)) => o.into_pointer(),
+    //         },
+    //     }
+    // }
 
     #[inline]
     fn remove_key(&self, key: &(impl ?Sized + Hash + Equivalent<T::Key>)) -> Option<Self::Pointer> {
@@ -165,57 +164,57 @@ where
     }
 }
 
-#[inline]
-pub(crate) fn impl_insert<T, S>(store: &S, value: T) -> S::Pointer
-where
-    T: Value,
-    S: Store<T>,
-{
-    match store.entry(value.key()) {
-        Entry::Occupied(o) => o.insert(value),
-        Entry::Vacant(v) => v.insert(value),
-    }
-}
+// #[inline]
+// pub(crate) fn impl_insert<T, S>(store: &S, value: T) -> S::Pointer
+// where
+//     T: Value,
+//     S: Store<T>,
+// {
+//     match store.entry(value.key()) {
+//         Entry::Occupied(o) => o.insert(value),
+//         Entry::Vacant(v) => v.insert(value),
+//     }
+// }
 
-#[inline]
-pub(crate) fn impl_or_insert<T, S>(store: &S, value: T) -> S::Pointer
-where
-    T: Value,
-    S: Store<T>,
-{
-    match store.entry(value.key()) {
-        Entry::Occupied(o) => o.into_pointer(),
-        Entry::Vacant(v) => v.insert(value),
-    }
-}
+// #[inline]
+// pub(crate) fn impl_or_insert<T, S>(store: &S, value: T) -> S::Pointer
+// where
+//     T: Value,
+//     S: Store<T>,
+// {
+//     match store.entry(value.key()) {
+//         Entry::Occupied(o) => o.into_pointer(),
+//         Entry::Vacant(v) => v.insert(value),
+//     }
+// }
 
-#[inline]
-pub(crate) fn impl_remove<T, S>(store: &S, value: &T) -> Option<S::Pointer>
-where
-    T: Value,
-    S: Store<T>,
-{
-    store.remove_key(value.key())
-}
+// #[inline]
+// pub(crate) fn impl_remove<T, S>(store: &S, value: &T) -> Option<S::Pointer>
+// where
+//     T: Value,
+//     S: Store<T>,
+// {
+//     store.remove_key(value.key())
+// }
 
-#[inline]
-pub(crate) fn impl_upsert<T, S>(
-    store: &S,
-    value: T,
-    f: impl FnOnce(T, &S::Pointer) -> Option<T>,
-) -> S::Pointer
-where
-    T: Value,
-    S: Store<T>,
-{
-    match store.entry(value.key()) {
-        Entry::Occupied(o) => {
-            if let Some(replacement) = f(value, o.pointer()) {
-                o.insert(replacement)
-            } else {
-                o.into_pointer()
-            }
-        }
-        Entry::Vacant(v) => v.insert(value),
-    }
-}
+// #[inline]
+// pub(crate) fn impl_upsert<T, S>(
+//     store: &S,
+//     value: T,
+//     f: impl FnOnce(T, &S::Pointer) -> Option<T>,
+// ) -> S::Pointer
+// where
+//     T: Value,
+//     S: Store<T>,
+// {
+//     match store.entry(value.key()) {
+//         Entry::Occupied(o) => {
+//             if let Some(replacement) = f(value, o.pointer()) {
+//                 o.insert(replacement)
+//             } else {
+//                 o.into_pointer()
+//             }
+//         }
+//         Entry::Vacant(v) => v.insert(value),
+//     }
+// }
